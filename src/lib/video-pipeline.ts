@@ -706,34 +706,40 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
       const fileName = outputFileName(jobId, i);
       const finalPath = path.join(outputDir, fileName);
 
+      // Layout constants
+      // Black header bar at top with title, video pushed below it.
+      const HEADER_H = 200;  // px for the black title bar
+      const FOOTER_H = 180;  // px for the bottom watermark bar
+      const VIDEO_H = 1920 - HEADER_H; // remaining space for the video
+
       if (applySplitScreen) {
         // -----------------------------------------------------------------
         // Split-screen compositing for landscape video
-        // Splits the frame into left/right halves, scales each to 1080x960,
-        // stacks vertically into 1080x1920, then applies overlays.
+        // Each half scaled to 1080x(VIDEO_H/2), stacked vertically,
+        // then padded with black header bar for the title.
         // -----------------------------------------------------------------
-        const safeSubPath = hasSubtitles
-          ? ensurePathForSubtitlesFilter(subtitlePath)
-          : "";
+        const halfH = Math.floor(VIDEO_H / 2);
 
-        // FFmpeg filter_complex: semicolons separate independent chains,
-        // commas chain filters within a single stream.
         const overlayFilters = [
-          `drawbox=x=0:y=h-220:w=iw:h=220:color=black@0.45:t=fill`,
-          `drawbox=x=0:y=958:w=iw:h=4:color=white@0.3:t=fill`,
-          // Title: white box with dark text (reference clip style)
-          `drawtext=text='${safeTitle}':font=Arial:fontcolor=black:fontsize=44:x=(w-text_w)/2:y=60:box=1:boxcolor=white@0.92:boxborderw=18`,
-          `drawtext=text='${safeWatermark}':font=Arial:fontcolor=white@0.90:fontsize=34:x=(w-text_w)/2:y=h-th-65`,
+          // Bottom bar for watermark
+          `drawbox=x=0:y=h-${FOOTER_H}:w=iw:h=${FOOTER_H}:color=black@0.50:t=fill`,
+          // Divider line between the two halves
+          `drawbox=x=0:y=${HEADER_H + halfH - 2}:w=iw:h=4:color=white@0.3:t=fill`,
+          // Title: white text on the black header
+          `drawtext=text='${safeTitle}':font=Arial:fontcolor=white:fontsize=44:x=(w-text_w)/2:y=${Math.floor(HEADER_H / 2 - 22)}`,
+          // Watermark
+          `drawtext=text='${safeWatermark}':font=Arial:fontcolor=white@0.90:fontsize=34:x=(w-text_w)/2:y=h-th-55`,
         ];
         if (hasSubtitles) {
+          const safeSubPath = ensurePathForSubtitlesFilter(subtitlePath);
           overlayFilters.push(`subtitles='${safeSubPath}'`);
         }
 
         const filterComplex = [
           `[0:v]split[a][b]`,
-          `[a]crop=iw/2:ih:0:0,scale=1080:960[left]`,
-          `[b]crop=iw/2:ih:iw/2:0,scale=1080:960[right]`,
-          `[left][right]vstack,${overlayFilters.join(",")}[out]`,
+          `[a]crop=iw/2:ih:0:0,scale=1080:${halfH}[left]`,
+          `[b]crop=iw/2:ih:iw/2:0,scale=1080:${halfH}[right]`,
+          `[left][right]vstack,pad=1080:1920:0:${HEADER_H}:black,${overlayFilters.join(",")}[out]`,
         ].join(";");
 
         await runFfmpeg([
@@ -755,11 +761,12 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         ]);
       } else {
         // -----------------------------------------------------------------
-        // Standard vertical crop (1080x1920)
+        // Standard vertical crop
+        // Video scaled to 1080xVIDEO_H, padded with black header on top.
         // -----------------------------------------------------------------
         const filters: string[] = [
-          // Bottom bar for watermark readability
-          `drawbox=x=0:y=h-220:w=iw:h=220:color=black@0.45:t=fill`,
+          // Bottom bar for watermark
+          `drawbox=x=0:y=h-${FOOTER_H}:w=iw:h=${FOOTER_H}:color=black@0.50:t=fill`,
         ];
 
         if (hasSubtitles) {
@@ -767,21 +774,23 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
           filters.push(`subtitles='${safeSubPath}'`);
         }
 
-        // Title: white box with dark text (reference clip style)
+        // Title: white text centered on the black header bar
         filters.push(
-          `drawtext=text='${safeTitle}':font=Arial:fontcolor=black:fontsize=44:x=(w-text_w)/2:y=60:box=1:boxcolor=white@0.92:boxborderw=18`,
+          `drawtext=text='${safeTitle}':font=Arial:fontcolor=white:fontsize=44:x=(w-text_w)/2:y=${Math.floor(HEADER_H / 2 - 22)}`,
         );
+        // Watermark on bottom bar
         filters.push(
-          `drawtext=text='${safeWatermark}':font=Arial:fontcolor=white@0.90:fontsize=34:x=(w-text_w)/2:y=h-th-65`,
+          `drawtext=text='${safeWatermark}':font=Arial:fontcolor=white@0.90:fontsize=34:x=(w-text_w)/2:y=h-th-55`,
         );
 
+        // scale → crop to VIDEO_H → pad with HEADER_H black bar on top → overlays
         await runFfmpeg([
           "-y",
           "-ss", start.toFixed(2),
           "-t", durationForClip.toFixed(2),
           "-i", uploadFilePath,
           "-vf",
-          `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,${filters.join(",")}`,
+          `scale=1080:${VIDEO_H}:force_original_aspect_ratio=increase,crop=1080:${VIDEO_H},pad=1080:1920:0:${HEADER_H}:black,${filters.join(",")}`,
           "-c:v", "libx264",
           "-preset", clipVideoPreset,
           "-crf", clipVideoCrf,
