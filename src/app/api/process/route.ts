@@ -5,7 +5,7 @@ import { processVideo } from "@/lib/video-pipeline";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 300;
+export const maxDuration = 600;
 
 const booleanPreprocess = z.preprocess((value) => {
   if (typeof value === "string") return value.toLowerCase() === "true";
