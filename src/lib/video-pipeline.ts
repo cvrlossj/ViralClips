@@ -525,7 +525,7 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
       }
 
       try {
-        sceneChanges = await detectSceneChangeTimes(uploadFilePath);
+        sceneChanges = await detectSceneChangeTimes(uploadFilePath, duration);
       } catch (error) {
         diagnostics.push(
           error instanceof Error

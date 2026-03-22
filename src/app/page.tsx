@@ -134,25 +134,39 @@ export default function Home() {
 
   useEffect(() => {
     if (!loading || processingStartedAt === null) return;
-    const estimateMs =
-      Math.min(300, Math.max(40, clipCount * 10 + clipDuration * 0.9 + (smartMode ? 25 : 0))) *
-      1000;
+
+    // Estimate based on file size + pipeline features
+    const fileSizeMb = video ? video.size / (1024 * 1024) : 50;
+    const uploadTimeSec = fileSizeMb / 15; // ~15 MB/s local write
+    const transcriptionSec = smartMode ? Math.max(30, fileSizeMb * 0.12) : 0;
+    const sceneSec = smartMode ? Math.max(20, fileSizeMb * 0.08) : 0;
+    const renderSec = clipCount * Math.max(8, clipDuration * 0.5);
+    const titleSec = smartMode ? clipCount * 3 : 0;
+    const estimateMs = (uploadTimeSec + transcriptionSec + sceneSec + renderSec + titleSec) * 1000;
 
     const update = () => {
       const elapsed = Date.now() - processingStartedAt;
-      const projected = Math.min(94, 6 + (elapsed / estimateMs) * 88);
+      // Progress curve: fast start, slows down as it approaches 94%
+      const ratio = elapsed / estimateMs;
+      const projected = Math.min(94, 6 + 88 * (1 - Math.exp(-2.5 * ratio)));
       setProgressValue((prev) => (projected > prev ? projected : prev));
-      setEtaSeconds(Math.ceil(Math.max(0, estimateMs - elapsed) / 1000));
-      if (projected < 18) setProgressStage("Subiendo video");
-      else if (projected < 42) setProgressStage("Transcribiendo audio");
-      else if (projected < 68) setProgressStage("Analizando escenas");
+
+      const remaining = Math.max(0, estimateMs - elapsed);
+      // When past the estimate, show "procesando" instead of "0s"
+      setEtaSeconds(remaining > 1000 ? Math.ceil(remaining / 1000) : null);
+
+      // Dynamic stage based on elapsed proportion
+      if (ratio < 0.1) setProgressStage("Subiendo video");
+      else if (ratio < 0.4) setProgressStage("Transcribiendo audio");
+      else if (ratio < 0.55) setProgressStage("Generando titulos");
+      else if (ratio < 0.7) setProgressStage("Analizando escenas");
       else setProgressStage("Renderizando clips");
     };
 
     update();
-    const id = window.setInterval(update, 350);
+    const id = window.setInterval(update, 500);
     return () => window.clearInterval(id);
-  }, [loading, processingStartedAt, clipCount, clipDuration, smartMode]);
+  }, [loading, processingStartedAt, clipCount, clipDuration, smartMode, video]);
 
   const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); };
   const handleDragLeave = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); };
@@ -518,9 +532,11 @@ export default function Home() {
                     <span>{Math.round(progressValue)}%</span>
                   </div>
                   <Progress value={progressValue} />
-                  {loading && etaSeconds !== null && (
+                  {loading && (
                     <p className="text-xs text-(--muted-fg)">
-                      ETA: {formatSeconds(etaSeconds)}
+                      {etaSeconds !== null
+                        ? `ETA: ${formatSeconds(etaSeconds)}`
+                        : "Procesando, esto puede tardar unos minutos..."}
                     </p>
                   )}
                 </div>

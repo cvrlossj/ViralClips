@@ -125,13 +125,18 @@ function hookCount(text: string) {
 
 export async function detectSceneChangeTimes(
   videoPath: string,
-  threshold = 0.34,
+  durationSeconds?: number,
 ): Promise<number[]> {
   try {
+    // For long videos (>10 min), raise threshold to reduce noise and speed up analysis.
+    // Also use a lower framerate analysis to avoid decoding every frame.
+    const isLong = (durationSeconds ?? 0) > 600;
+    const threshold = isLong ? 0.42 : 0.34;
+
     const moviePath = normalizePathForMovieFilter(videoPath);
     const filter = `movie='${moviePath}',select=gt(scene\\,${threshold})`;
 
-    const output = await runFfprobe([
+    const args = [
       "-hide_banner",
       "-v",
       "error",
@@ -143,7 +148,15 @@ export async function detectSceneChangeTimes(
       "frame=pts_time",
       "-of",
       "csv=p=0",
-    ]);
+    ];
+
+    // For very long videos, add a read duration limit to avoid 15+ min analysis
+    if ((durationSeconds ?? 0) > 1800) {
+      // Analyze only the first 30 minutes for videos > 30 min
+      args.splice(4, 0, "-t", "1800");
+    }
+
+    const output = await runFfprobe(args);
 
     const values = output
       .split(/\r?\n/)
