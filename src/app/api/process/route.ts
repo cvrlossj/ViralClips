@@ -1,7 +1,14 @@
+import { createWriteStream } from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { Readable } from "node:stream";
+import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import Busboy from "busboy";
 import { assertFfmpegInstalled } from "@/lib/ffmpeg";
 import { processVideo } from "@/lib/video-pipeline";
+import { tempDir } from "@/lib/paths";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -23,33 +30,90 @@ const formSchema = z.object({
   autoTitle: booleanPreprocess.default(false),
 });
 
-export async function POST(request: Request) {
-  try {
-    await assertFfmpegInstalled();
+type UploadResult = {
+  filePath: string;
+  fileName: string;
+  fields: Record<string, string>;
+};
 
-    const formData = await request.formData();
-    const video = formData.get("video");
+/**
+ * Parses multipart form data by streaming the file directly to disk.
+ * This avoids loading the entire video into memory (supports multi-GB files).
+ */
+function parseMultipart(request: Request): Promise<UploadResult> {
+  return new Promise((resolve, reject) => {
+    const contentType = request.headers.get("content-type") ?? "";
+    const fields: Record<string, string> = {};
+    let filePath = "";
+    let fileName = "";
+    let fileReceived = false;
 
-    if (!(video instanceof File)) {
-      return NextResponse.json(
-        { error: "Debes adjuntar un video valido." },
-        { status: 400 },
-      );
+    const busboy = Busboy({
+      headers: { "content-type": contentType },
+      limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB
+    });
+
+    busboy.on("file", (_fieldname, stream, info) => {
+      fileReceived = true;
+      fileName = info.filename || "upload.mp4";
+      const ext = path.extname(fileName).toLowerCase() || ".mp4";
+      filePath = path.join(tempDir, `upload_${randomUUID().slice(0, 8)}${ext}`);
+
+      const writeStream = createWriteStream(filePath);
+      stream.pipe(writeStream);
+
+      writeStream.on("error", (err) => reject(err));
+    });
+
+    busboy.on("field", (name, value) => {
+      fields[name] = value;
+    });
+
+    busboy.on("finish", () => {
+      if (!fileReceived || !filePath) {
+        reject(new Error("No se recibio ningun archivo de video."));
+        return;
+      }
+      resolve({ filePath, fileName, fields });
+    });
+
+    busboy.on("error", (err) => reject(err));
+
+    // Pipe the Web ReadableStream into busboy (Node.js Readable)
+    const body = request.body;
+    if (!body) {
+      reject(new Error("Request body vacio."));
+      return;
     }
 
+    const nodeStream = Readable.fromWeb(body as import("stream/web").ReadableStream);
+    nodeStream.pipe(busboy);
+  });
+}
+
+export async function POST(request: Request) {
+  try {
+    await Promise.all([
+      assertFfmpegInstalled(),
+      fs.mkdir(tempDir, { recursive: true }),
+    ]);
+
+    const { filePath, fileName, fields } = await parseMultipart(request);
+
     const payload = formSchema.parse({
-      title: formData.get("title"),
-      watermark: formData.get("watermark"),
-      clips: formData.get("clips"),
-      clipDuration: formData.get("clipDuration"),
-      subtitleSize: formData.get("subtitleSize"),
-      smartMode: formData.get("smartMode"),
-      splitScreen: formData.get("splitScreen"),
-      autoTitle: formData.get("autoTitle"),
+      title: fields.title,
+      watermark: fields.watermark,
+      clips: fields.clips,
+      clipDuration: fields.clipDuration,
+      subtitleSize: fields.subtitleSize,
+      smartMode: fields.smartMode,
+      splitScreen: fields.splitScreen,
+      autoTitle: fields.autoTitle,
     });
 
     const result = await processVideo({
-      file: video,
+      filePath,
+      fileName,
       title: payload.title,
       watermark: payload.watermark,
       clipCount: payload.clips,

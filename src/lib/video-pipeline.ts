@@ -33,7 +33,10 @@ const titleClient = process.env.OPENAI_API_KEY
   : null;
 
 type PipelineInput = {
-  file: File;
+  /** Path to the video file already saved on disk */
+  filePath: string;
+  /** Original file name (for extension detection) */
+  fileName: string;
   title: string;
   watermark: string;
   clipCount: number;
@@ -445,11 +448,16 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
   const jobId = `${Date.now()}_${randomUUID().slice(0, 8)}`;
   await ensureStorageFolders();
 
+  // The file is already saved to disk by the route handler (streaming upload).
+  // We just rename/move it into our upload directory with a job-specific name.
   const extension =
-    path.extname(input.file.name).toLowerCase().replace(/[^a-z0-9.]/g, "") || ".mp4";
+    path.extname(input.fileName).toLowerCase().replace(/[^a-z0-9.]/g, "") || ".mp4";
   const uploadFilePath = path.join(uploadDir, `${jobId}${extension}`);
-  const data = Buffer.from(await input.file.arrayBuffer());
-  await fs.writeFile(uploadFilePath, data);
+  await fs.rename(input.filePath, uploadFilePath).catch(async () => {
+    // rename fails across different drives/partitions — fallback to copy+delete
+    await fs.copyFile(input.filePath, uploadFilePath);
+    await fs.rm(input.filePath, { force: true });
+  });
   const fullAudioPath = path.join(tempDir, `${jobId}_full.mp3`);
 
   try {
