@@ -80,6 +80,49 @@ export async function getMediaDurationSeconds(filePath: string): Promise<number>
   return parsed;
 }
 
+export async function getMediaDimensions(
+  filePath: string,
+): Promise<{ width: number; height: number }> {
+  const output = await runBinary(ffprobeBin, [
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "stream=width,height",
+    "-of",
+    "csv=p=0:s=x",
+    filePath,
+  ]);
+  const parts = output.trim().split("x");
+  const width = parseInt(parts[0], 10);
+  const height = parseInt(parts[1], 10);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    throw new Error("No se pudieron leer las dimensiones del video.");
+  }
+  return { width, height };
+}
+
+/**
+ * Extracts audio from a video file to a compressed mono MP3 (16kHz).
+ * Whisper accepts max 25MB — this reduces a multi-GB video to a few MB of audio.
+ */
+export async function extractCompressedAudio(
+  inputPath: string,
+  outputPath: string,
+): Promise<void> {
+  await runBinary(ffmpegBin, [
+    "-y",
+    "-i", inputPath,
+    "-vn",
+    "-ac", "1",
+    "-ar", "16000",
+    "-b:a", "48k",
+    "-f", "mp3",
+    outputPath,
+  ]);
+}
+
 export async function runFfmpeg(args: string[]) {
   await runBinary(ffmpegBin, args);
 }

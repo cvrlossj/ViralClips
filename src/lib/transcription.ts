@@ -11,9 +11,16 @@ export type TranscriptSegment = {
   noSpeechProb?: number;
 };
 
+export type TranscriptWord = {
+  word: string;
+  start: number;
+  end: number;
+};
+
 export type TranscriptData = {
   text: string;
   segments: TranscriptSegment[];
+  words: TranscriptWord[];
 };
 
 export function canTranscribe() {
@@ -27,7 +34,7 @@ export async function transcribeToSrt(inputAudioOrVideoPath: string) {
 
   const response = await client.audio.transcriptions.create({
     file: fs.createReadStream(inputAudioOrVideoPath),
-    model: "gpt-4o-mini-transcribe",
+    model: "whisper-1",
     response_format: "srt",
   });
 
@@ -47,8 +54,9 @@ export async function transcribeVerbose(
 
   const response = (await client.audio.transcriptions.create({
     file: fs.createReadStream(inputAudioOrVideoPath),
-    model: "gpt-4o-mini-transcribe",
+    model: "whisper-1",
     response_format: "verbose_json",
+    timestamp_granularities: ["word", "segment"],
   })) as {
     text?: string;
     segments?: Array<{
@@ -56,6 +64,11 @@ export async function transcribeVerbose(
       end?: number;
       text?: string;
       no_speech_prob?: number;
+    }>;
+    words?: Array<{
+      word?: string;
+      start?: number;
+      end?: number;
     }>;
   };
 
@@ -77,10 +90,63 @@ export async function transcribeVerbose(
         segment.text.length > 0,
     );
 
+  const words = (response.words ?? [])
+    .map((w) => ({
+      word: String(w.word ?? "").trim(),
+      start: Number(w.start ?? 0),
+      end: Number(w.end ?? 0),
+    }))
+    .filter(
+      (w) =>
+        w.word.length > 0 &&
+        w.end > w.start &&
+        Number.isFinite(w.start) &&
+        Number.isFinite(w.end),
+    );
+
   const text = String(response.text ?? "").trim();
   if (!text && segments.length === 0) {
     throw new Error("No se pudo construir la transcripcion del video.");
   }
 
-  return { text, segments };
+  return { text, segments, words };
+}
+
+/**
+ * Transcribe audio and return only word-level timestamps.
+ * Used for karaoke-style subtitles on individual clips.
+ */
+export async function transcribeWords(
+  inputAudioOrVideoPath: string,
+): Promise<TranscriptWord[]> {
+  if (!client) {
+    throw new Error("OPENAI_API_KEY no configurada.");
+  }
+
+  const response = (await client.audio.transcriptions.create({
+    file: fs.createReadStream(inputAudioOrVideoPath),
+    model: "whisper-1",
+    response_format: "verbose_json",
+    timestamp_granularities: ["word"],
+  })) as {
+    words?: Array<{
+      word?: string;
+      start?: number;
+      end?: number;
+    }>;
+  };
+
+  return (response.words ?? [])
+    .map((w) => ({
+      word: String(w.word ?? "").trim(),
+      start: Number(w.start ?? 0),
+      end: Number(w.end ?? 0),
+    }))
+    .filter(
+      (w) =>
+        w.word.length > 0 &&
+        w.end > w.start &&
+        Number.isFinite(w.start) &&
+        Number.isFinite(w.end),
+    );
 }

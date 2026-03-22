@@ -1,13 +1,33 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f8f6ef;
-  --foreground: #14130f;
-  --surface: #fffdf6;
-  --surface-2: #f0ead8;
-  --line: #262116;
-  --accent: #b9412e;
-  --accent-2: #195d4e;
+  /* Core */
+  --background: #09090b;
+  --foreground: #f4f4f5;
+
+  /* Surfaces */
+  --surface: #111116;
+  --surface-2: #1c1c24;
+  --surface-3: #252530;
+
+  /* Borders */
+  --line: #2d2d38;
+  --line-2: #3d3d4d;
+
+  /* Brand accent — violet */
+  --accent: #7c3aed;
+  --accent-hover: #6d28d9;
+  --accent-fg: #f5f3ff;
+
+  /* Success accent — emerald */
+  --accent-2: #10b981;
+  --accent-2-fg: #ecfdf5;
+
+  /* Muted */
+  --muted-fg: #71717a;
+
+  /* Radius */
+  --radius: 0.75rem;
 }
 
 @theme inline {
@@ -27,16 +47,19 @@ body {
   border-color: var(--line);
 }
 
+/* Subtle grain + violet ambient glow */
 .grain {
   background-image:
-    radial-gradient(circle at 20% 15%, rgba(185, 65, 46, 0.15), transparent 38%),
-    radial-gradient(circle at 80% 10%, rgba(25, 93, 78, 0.16), transparent 36%),
-    radial-gradient(circle at 65% 90%, rgba(185, 65, 46, 0.08), transparent 30%),
-    repeating-linear-gradient(
-      45deg,
-      transparent,
-      transparent 2px,
-      rgba(20, 19, 15, 0.02) 2px,
-      rgba(20, 19, 15, 0.02) 4px
-    );
+    radial-gradient(ellipse at 20% 0%, rgba(124, 58, 237, 0.18), transparent 55%),
+    radial-gradient(ellipse at 80% 0%, rgba(99, 102, 241, 0.08), transparent 45%),
+    radial-gradient(ellipse at 50% 100%, rgba(124, 58, 237, 0.06), transparent 40%);
+}
+
+/* Glow effect on primary button */
+.btn-glow {
+  box-shadow: 0 0 20px rgba(124, 58, 237, 0.4), 0 0 40px rgba(124, 58, 237, 0.15);
+}
+
+.btn-glow:hover {
+  box-shadow: 0 0 28px rgba(124, 58, 237, 0.55), 0 0 50px rgba(124, 58, 237, 0.2);
 }

@@ -14,8 +14,8 @@ const ibmPlexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ViralClips Local MVP",
-  description: "Generador local de clips virales para redes sociales.",
+  title: "ViralClips — AI Studio",
+  description: "Generador local de clips virales con IA. Transcripcion, deteccion de escenas y re-ranking LLM para YouTube Shorts, TikTok e Instagram Reels.",
 };
 
 export default function RootLayout({

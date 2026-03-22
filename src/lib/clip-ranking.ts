@@ -15,24 +15,93 @@ const rerankClient = process.env.OPENAI_API_KEY
   : null;
 
 const hookWords = [
-  "mira",
-  "escucha",
-  "atento",
-  "increible",
-  "nunca",
-  "nadie",
-  "secreto",
-  "brutal",
-  "locura",
-  "error",
-  "falla",
-  "giro",
-  "impactante",
-  "viral",
-  "gracioso",
-  "epico",
-  "momento",
+  // Retention triggers
+  "mira", "escucha", "atento", "espera", "ojo", "cuidado",
+  // Superlatives / Intensity
+  "increible", "brutal", "epico", "tremendo", "bestia", "genial", "alucinante",
+  // Conflict / Surprise
+  "nunca", "nadie", "jamas", "imposible", "sorpresa", "giro", "impactante",
+  // Curiosity triggers
+  "secreto", "lo que paso", "la verdad", "no sabian", "resulta que", "imagina",
+  // Emotion / Humor
+  "locura", "gracioso", "error", "falla", "vergüenza", "ridículo",
+  // Viral markers
+  "viral", "momento", "esto es", "se volvio", "no puedo", "te juro",
+  // English hooks (mixed content)
+  "look", "wait", "never", "suddenly", "literally", "actually", "insane",
+  "crazy", "wild", "watch", "but then", "right here",
 ];
+
+// ---------------------------------------------------------------------------
+// Ad / sponsor detection
+// ---------------------------------------------------------------------------
+// Scans transcript segments for common ad markers in Spanish and English.
+// Returns time ranges that should be avoided when selecting clip windows.
+// ---------------------------------------------------------------------------
+
+const adMarkers = [
+  // Spanish
+  "patrocinado", "patrocina", "sponsor", "sponsoreado",
+  "codigo de descuento", "cupon", "link en la descripcion",
+  "link en la bio", "usa mi codigo", "con mi codigo",
+  "te dejo el link", "descarga la app", "descarga gratis",
+  "suscribete", "dale like", "activa la campana",
+  "compra aqui", "aprovecha la oferta", "oferta especial",
+  "prueba gratis", "registrate", "entra a",
+  // English
+  "sponsored by", "use my code", "promo code", "discount code",
+  "check the link", "link in the description", "link in bio",
+  "download the app", "free trial", "sign up",
+  "brought to you by", "thanks to", "shout out to",
+];
+
+export type AdSegment = {
+  start: number;
+  end: number;
+};
+
+export function detectAdSegments(
+  segments: TranscriptSegment[],
+  bufferSeconds = 3,
+): AdSegment[] {
+  const adRanges: AdSegment[] = [];
+
+  for (const seg of segments) {
+    const lower = seg.text.toLowerCase();
+    const isAd = adMarkers.some((marker) => lower.includes(marker));
+    if (!isAd) continue;
+
+    // Extend the ad range by bufferSeconds on each side to capture the full promo block
+    const start = Math.max(0, seg.start - bufferSeconds);
+    const end = seg.end + bufferSeconds;
+
+    // Merge with previous range if overlapping
+    const last = adRanges[adRanges.length - 1];
+    if (last && start <= last.end) {
+      last.end = Math.max(last.end, end);
+    } else {
+      adRanges.push({ start, end });
+    }
+  }
+
+  return adRanges;
+}
+
+export function isWindowInAdSegment(
+  windowStart: number,
+  clipDuration: number,
+  adSegments: AdSegment[],
+  overlapThreshold = 0.3,
+): boolean {
+  const windowEnd = windowStart + clipDuration;
+  for (const ad of adSegments) {
+    const overlapStart = Math.max(windowStart, ad.start);
+    const overlapEnd = Math.min(windowEnd, ad.end);
+    const overlap = Math.max(0, overlapEnd - overlapStart);
+    if (overlap / clipDuration >= overlapThreshold) return true;
+  }
+  return false;
+}
 
 function normalizePathForMovieFilter(filePath: string) {
   return filePath
@@ -263,20 +332,38 @@ export async function rerankWithLlm(params: {
   }));
 
   const prompt = [
-    "Eres editor senior de clips virales.",
-    `Selecciona ${clipCount} ventanas de ${clipDuration}s con mejor retencion y contexto narrativo.`,
-    "Prioriza hook temprano, continuidad y cierre parcial.",
-    "Devuelve JSON estricto con formato:",
-    '{"selected":[{"start":12.3,"score":88,"rationale":"..."}]}',
-    "No incluyas texto fuera del JSON.",
+    "Eres un editor experto en contenido viral para YouTube Shorts, TikTok e Instagram Reels.",
+    `Selecciona exactamente ${clipCount} clips de ${clipDuration}s con MAXIMO potencial de retencion.`,
+    "",
+    "CRITERIOS DE SELECCION (en orden de importancia):",
+    "1. HOOK INICIAL (40%): Los primeros 3 segundos detienen el scroll? Busca sorpresa, humor, tension, drama o una revelacion.",
+    "2. ARCO DE RETENCION (30%): El clip genera curiosidad que recompensa al espectador que se queda hasta el final?",
+    "3. ENERGIA Y DENSIDAD (20%): Alta densidad de palabras, emocion clara, ritmo dinamico.",
+    "4. CORTES LIMPIOS (10%): Comienza en el inicio de una frase, termina en una pausa natural.",
+    "",
+    `REGLA OBLIGATORIA: Cada clip DEBE estar separado por al menos ${clipDuration}s del siguiente. NO repitas el mismo momento.`,
+    "",
+    "PENALIZA FUERTEMENTE: inicios a mitad de oracion, silencios prolongados, contenido repetitivo o sin carga emocional.",
+    "PRIORIZA: momentos graciosos, giros inesperados, revelaciones, reacciones extremas, momentos de maxima tension.",
+    "",
+    `Devuelve UNICAMENTE JSON valido con exactamente ${clipCount} elementos, sin texto adicional:`,
+    '{"selected":[{"start":12.3,"score":95,"rationale":"hook en primeros 2s + tension narrativa sostenida"}]}',
+    "",
     `Candidatos: ${JSON.stringify(shortlist)}`,
   ].join("\n");
 
   try {
     const response = await rerankClient.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.2,
-      messages: [{ role: "user", content: prompt }],
+      model: "gpt-4o",
+      temperature: 0.15,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Eres un editor experto en videos virales. Respondes SOLO con JSON valido, sin markdown ni texto adicional.",
+        },
+        { role: "user", content: prompt },
+      ],
     });
 
     const content = response.choices[0]?.message?.content ?? "";
@@ -302,31 +389,39 @@ export async function rerankWithLlm(params: {
       return null;
     }
 
-    const mapped = selected
-      .slice(0, clipCount)
-      .map((item) => {
-        const nearest = candidates.reduce((best, candidate) => {
-          if (!best) {
-            return candidate;
-          }
-          const d1 = Math.abs(candidate.start - item.start);
-          const d2 = Math.abs(best.start - item.start);
-          return d1 < d2 ? candidate : best;
-        }, null as CandidateWindow | null);
+    // Map LLM picks back to actual candidates, enforcing minimum gap
+    const minGap = clipDuration * 0.8;
+    const mapped: CandidateWindow[] = [];
+    const usedStarts = new Set<number>();
 
-        if (!nearest) {
-          return null;
-        }
+    for (const item of selected.slice(0, clipCount * 2)) {
+      if (mapped.length >= clipCount) break;
 
-        return {
-          ...nearest,
-          score: Number(item.score.toFixed(2)),
-          rationale: item.rationale,
-        };
-      })
-      .filter((item): item is CandidateWindow => Boolean(item));
+      const nearest = candidates.reduce((best, candidate) => {
+        if (!best) return candidate;
+        const d1 = Math.abs(candidate.start - item.start);
+        const d2 = Math.abs(best.start - item.start);
+        return d1 < d2 ? candidate : best;
+      }, null as CandidateWindow | null);
 
-    return mapped;
+      if (!nearest) continue;
+
+      // Skip if this candidate was already used or too close to a previous pick
+      if (usedStarts.has(nearest.start)) continue;
+      const tooClose = mapped.some(
+        (prev) => Math.abs(prev.start - nearest.start) < minGap,
+      );
+      if (tooClose) continue;
+
+      usedStarts.add(nearest.start);
+      mapped.push({
+        ...nearest,
+        score: Number(item.score.toFixed(2)),
+        rationale: item.rationale,
+      });
+    }
+
+    return mapped.length > 0 ? mapped : null;
   } catch {
     return null;
   }

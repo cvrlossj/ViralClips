@@ -5,7 +5,7 @@ function Card({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
       className={cn(
-        "rounded-2xl border border-[var(--line)] bg-[var(--surface)] text-[var(--foreground)] shadow-[0_12px_30px_rgba(20,19,15,0.08)]",
+        "rounded-xl border border-[var(--line)] bg-[var(--surface)] text-[var(--foreground)] shadow-[0_0_0_1px_rgba(255,255,255,0.03),0_8px_32px_rgba(0,0,0,0.4)]",
         className,
       )}
       {...props}
@@ -18,11 +18,18 @@ function CardHeader({ className, ...props }: React.HTMLAttributes<HTMLDivElement
 }
 
 function CardTitle({ className, ...props }: React.HTMLAttributes<HTMLHeadingElement>) {
-  return <h3 className={cn("font-semibold leading-none tracking-tight", className)} {...props} />;
+  return (
+    <h3
+      className={cn("font-semibold leading-none tracking-tight text-[var(--foreground)]", className)}
+      {...props}
+    />
+  );
 }
 
 function CardDescription({ className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
-  return <p className={cn("text-sm text-[var(--foreground)]/75", className)} {...props} />;
+  return (
+    <p className={cn("text-sm text-[var(--muted-fg)]", className)} {...props} />
+  );
 }
 
 function CardContent({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
