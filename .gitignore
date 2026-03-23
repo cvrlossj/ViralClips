@@ -45,6 +45,12 @@ next-env.d.ts
 /storage/uploads/*
 /storage/outputs/*
 /storage/tmp/*
+/storage/sources/*
+/storage/jobs/*
+/storage/frames/*
 !/storage/uploads/.gitkeep
 !/storage/outputs/.gitkeep
 !/storage/tmp/.gitkeep
+
+# claude
+.claude/
