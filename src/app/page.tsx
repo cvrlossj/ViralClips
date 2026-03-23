@@ -4,14 +4,18 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   CheckCircle2,
+  Clock,
   Cpu,
   Download,
-  Film,
+
   Loader2,
+  Pencil,
   Settings2,
+  Trash2,
   Type,
   Upload,
   XCircle,
+  Zap,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -30,15 +34,25 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
+type ClipScores = {
+  hook: number;
+  flow: number;
+  engagement: number;
+  completeness: number;
+};
+
 type ClipResult = {
   fileName: string;
   url: string;
   startSeconds: number;
   durationSeconds: number;
   hasSubtitles: boolean;
-  score: number;
+  scores: ClipScores;
+  overallScore: number;
   rationale: string;
   title: string;
+  thumbnailUrl?: string;
+  hookApplied?: boolean;
 };
 
 type ProcessResponse = {
@@ -58,32 +72,18 @@ function formatFileSize(bytes: number) {
   return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
 }
 
-// Dot indicator for status
-function StatusDot({ state }: { state: "ok" | "error" | "loading" }) {
-  return (
-    <span
-      className={`inline-block h-2 w-2 rounded-full ${
-        state === "ok"
-          ? "bg-(--accent-2)"
-          : state === "error"
-            ? "bg-red-500"
-            : "bg-yellow-500 animate-pulse"
-      }`}
-    />
-  );
-}
 
 export default function Home() {
   const [video, setVideo] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [title, setTitle] = useState("Momento viral del dia");
   const [watermark, setWatermark] = useState("@TuCanal");
-  const [clipCount, setClipCount] = useState(6);
-  const [clipDuration, setClipDuration] = useState(28);
-  const [subtitleSize, setSubtitleSize] = useState(24);
-  const [smartMode, setSmartMode] = useState(true);
-  const [splitScreen, setSplitScreen] = useState(false);
+  const [clipCount, setClipCount] = useState(8);
+  const [subtitleSize, setSubtitleSize] = useState(44);
+  const [splitScreen, setSplitScreen] = useState(true);
   const [autoTitle, setAutoTitle] = useState(true);
+  const [captionPreset, setCaptionPreset] = useState("hormozi");
+  const [hookOptimizer, setHookOptimizer] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [response, setResponse] = useState<ProcessResponse | null>(null);
@@ -96,6 +96,9 @@ export default function Home() {
   const [progressStage, setProgressStage] = useState("En espera");
   const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
   const [processingStartedAt, setProcessingStartedAt] = useState<number | null>(null);
+  const [previousJobs, setPreviousJobs] = useState<
+    Array<{ jobId: string; sourceFileName: string; clipCount: number; createdAt: string }>
+  >([]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -124,6 +127,13 @@ export default function Home() {
       }
     };
     void check();
+
+    // Load previous job history
+    fetch("/api/jobs", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((data) => { if (mounted) setPreviousJobs(data); })
+      .catch(() => {});
+
     return () => { mounted = false; };
   }, []);
 
@@ -138,11 +148,12 @@ export default function Home() {
     // Estimate based on file size + pipeline features
     const fileSizeMb = video ? video.size / (1024 * 1024) : 50;
     const uploadTimeSec = fileSizeMb / 15; // ~15 MB/s local write
-    const transcriptionSec = smartMode ? Math.max(30, fileSizeMb * 0.12) : 0;
-    const sceneSec = smartMode ? Math.max(20, fileSizeMb * 0.08) : 0;
-    const renderSec = clipCount * Math.max(8, clipDuration * 0.5);
-    const titleSec = smartMode ? clipCount * 3 : 0;
-    const estimateMs = (uploadTimeSec + transcriptionSec + sceneSec + renderSec + titleSec) * 1000;
+    const transcriptionSec = Math.max(30, fileSizeMb * 0.12);
+    const sceneSec = Math.max(20, fileSizeMb * 0.08);
+    const visualAnalysisSec = Math.max(15, fileSizeMb * 0.06); // GPT-4o Vision keyframe analysis
+    const renderSec = clipCount * 12; // Variable duration clips average ~30s
+    const titleSec = clipCount * 3;
+    const estimateMs = (uploadTimeSec + transcriptionSec + sceneSec + visualAnalysisSec + renderSec + titleSec) * 1000;
 
     const update = () => {
       const elapsed = Date.now() - processingStartedAt;
@@ -156,17 +167,18 @@ export default function Home() {
       setEtaSeconds(remaining > 1000 ? Math.ceil(remaining / 1000) : null);
 
       // Dynamic stage based on elapsed proportion
-      if (ratio < 0.1) setProgressStage("Subiendo video");
-      else if (ratio < 0.4) setProgressStage("Transcribiendo audio");
-      else if (ratio < 0.55) setProgressStage("Generando titulos");
-      else if (ratio < 0.7) setProgressStage("Analizando escenas");
+      if (ratio < 0.08) setProgressStage("Subiendo video");
+      else if (ratio < 0.30) setProgressStage("Transcribiendo audio");
+      else if (ratio < 0.45) setProgressStage("Analizando frames (Vision AI)");
+      else if (ratio < 0.55) setProgressStage("Detectando momentos virales");
+      else if (ratio < 0.65) setProgressStage("Generando titulos");
       else setProgressStage("Renderizando clips");
     };
 
     update();
     const id = window.setInterval(update, 500);
     return () => window.clearInterval(id);
-  }, [loading, processingStartedAt, clipCount, clipDuration, smartMode, video]);
+  }, [loading, processingStartedAt, clipCount, video]);
 
   const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); };
   const handleDragLeave = (e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); };
@@ -186,11 +198,11 @@ export default function Home() {
     form.append("title", title);
     form.append("watermark", watermark);
     form.append("clips", String(clipCount));
-    form.append("clipDuration", String(clipDuration));
     form.append("subtitleSize", String(subtitleSize));
-    form.append("smartMode", String(smartMode));
     form.append("splitScreen", String(splitScreen));
     form.append("autoTitle", String(autoTitle));
+    form.append("captionPreset", captionPreset);
+    form.append("hookOptimizer", String(hookOptimizer));
 
     setLoading(true);
     setError(null);
@@ -226,28 +238,7 @@ export default function Home() {
 
   return (
     <div className="grain min-h-screen">
-      {/* Top nav */}
-      <header className="sticky top-0 z-20 border-b border-(--line) bg-(--background)/80 backdrop-blur-md">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 sm:px-8">
-          <div className="flex items-center gap-3">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-(--accent)">
-              <Film className="h-4 w-4 text-white" />
-            </div>
-            <span className="font-semibold tracking-tight">ViralClips</span>
-            <Badge variant="accent" className="font-mono text-[10px]">
-              AI STUDIO
-            </Badge>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <StatusDot
-              state={
-                backendReady === null ? "loading" : backendReady ? "ok" : "error"
-              }
-            />
-          </div>
-        </div>
-      </header>
+{/* removed top nav — tool is personal, no navigation needed */}
 
       <main className="mx-auto w-full max-w-7xl px-4 py-8 sm:px-8">
         {/* Hero */}
@@ -257,9 +248,9 @@ export default function Home() {
             <span className="text-(--accent)">clips virales</span>
           </h1>
           <p className="mt-3 max-w-2xl text-base text-(--muted-fg)">
-            Sube un video largo. El motor transcribe el audio, detecta escenas clave y aplica
-            re-ranking con LLM para elegir los momentos mas enganches. Salida vertical
-            1080x1920 lista para publicar.
+            Sube un video largo. El motor transcribe el audio, analiza frames con Vision AI,
+            detecta escenas clave y combina audio + video para elegir los mejores momentos.
+            Salida vertical 1080x1920 lista para publicar.
           </p>
         </div>
 
@@ -399,15 +390,15 @@ export default function Home() {
                         <span className="font-mono text-sm text-(--accent)">{subtitleSize}px</span>
                       </div>
                       <Slider
-                        min={16}
-                        max={36}
-                        step={1}
+                        min={24}
+                        max={56}
+                        step={2}
                         value={[subtitleSize]}
                         onValueChange={([v]) => setSubtitleSize(v)}
                       />
                       <div className="flex justify-between text-xs text-(--muted-fg)">
-                        <span>Pequeno (16px)</span>
-                        <span>Grande (36px)</span>
+                        <span>24px</span>
+                        <span>56px</span>
                       </div>
                     </div>
                   </TabsContent>
@@ -421,54 +412,76 @@ export default function Home() {
                       </div>
                       <Slider
                         min={1}
-                        max={12}
+                        max={20}
                         step={1}
                         value={[clipCount]}
                         onValueChange={([v]) => setClipCount(v)}
                       />
                       <div className="flex justify-between text-xs text-(--muted-fg)">
                         <span>1 clip</span>
-                        <span>12 clips</span>
+                        <span>20 clips</span>
                       </div>
                     </div>
 
                     <Separator />
 
+                    {/* Caption preset selector */}
                     <div className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <Label>Duracion por clip</Label>
-                        <span className="font-mono text-sm text-(--accent)">{clipDuration}s</span>
-                      </div>
-                      <Slider
-                        min={8}
-                        max={90}
-                        step={1}
-                        value={[clipDuration]}
-                        onValueChange={([v]) => setClipDuration(v)}
-                      />
-                      <div className="flex justify-between text-xs text-(--muted-fg)">
-                        <span>8s (corto)</span>
-                        <span>90s (largo)</span>
+                      <Label>Estilo de subtitulos</Label>
+                      <div className="grid grid-cols-3 gap-2">
+                        {([
+                          { id: "hormozi", name: "Hormozi", desc: "Bold, yellow highlight" },
+                          { id: "mrbeast", name: "MrBeast", desc: "Massive, red, energetico" },
+                          { id: "classic", name: "Clasico", desc: "Blanco con outline" },
+                          { id: "neon", name: "Neon", desc: "Glow cyan, gaming" },
+                          { id: "minimal", name: "Minimal", desc: "Discreto, con fondo" },
+                          { id: "karaoke-pop", name: "Karaoke Pop", desc: "Pop de escala, verde" },
+                        ] as const).map(({ id, name, desc }) => (
+                          <button
+                            key={id}
+                            type="button"
+                            onClick={() => setCaptionPreset(id)}
+                            className={`rounded-lg border px-3 py-2.5 text-left transition-all ${
+                              captionPreset === id
+                                ? "border-(--accent) bg-(--accent)/10 ring-1 ring-(--accent)/30"
+                                : "border-(--line) bg-(--surface-2) hover:border-(--line-2)"
+                            }`}
+                          >
+                            <p className="text-xs font-semibold">{name}</p>
+                            <p className="text-[10px] text-(--muted-fg) mt-0.5">{desc}</p>
+                          </button>
+                        ))}
                       </div>
                     </div>
 
                     <Separator />
 
+                    {/* Hook optimizer */}
                     <div className="flex items-center justify-between rounded-lg border border-(--line) bg-(--surface-2) px-4 py-3">
                       <div>
-                        <p className="text-sm font-medium">Modo inteligente</p>
+                        <div className="flex items-center gap-1.5">
+                          <Zap className="h-3.5 w-3.5 text-(--accent)" />
+                          <p className="text-sm font-medium">Hook optimizer</p>
+                        </div>
                         <p className="text-xs text-(--muted-fg) mt-0.5">
-                          Transcripcion + deteccion de escenas + re-ranking LLM.
+                          Tecnica Hormozi/MrBeast: muestra el momento mas impactante al inicio del clip para detener el scroll.
                         </p>
                       </div>
-                      <Switch checked={smartMode} onCheckedChange={setSmartMode} />
+                      <Switch checked={hookOptimizer} onCheckedChange={setHookOptimizer} />
+                    </div>
+
+                    <div className="rounded-lg border border-(--accent)/20 bg-(--accent)/5 px-4 py-3">
+                      <p className="text-sm font-medium">Duracion automatica</p>
+                      <p className="text-xs text-(--muted-fg) mt-0.5">
+                        La IA determina la duracion optima de cada clip (15s-180s) segun el contenido.
+                      </p>
                     </div>
 
                     <div className="flex items-center justify-between rounded-lg border border-(--line) bg-(--surface-2) px-4 py-3">
                       <div>
-                        <p className="text-sm font-medium">Split-screen</p>
+                        <p className="text-sm font-medium">Split-screen automatico</p>
                         <p className="text-xs text-(--muted-fg) mt-0.5">
-                          Divide videos landscape en dos vistas apiladas (ideal para podcasts).
+                          Auto-detecta videos landscape y los divide en dos vistas. Desactiva si no quieres split.
                         </p>
                       </div>
                       <Switch checked={splitScreen} onCheckedChange={setSplitScreen} />
@@ -547,13 +560,19 @@ export default function Home() {
                 <div className="space-y-2 text-xs">
                   {[
                     { label: "Transcripcion Whisper-1", enabled: true },
+                    { label: "Analisis visual GPT-4o Vision", enabled: true },
+                    { label: "Deteccion multimodal (audio + video)", enabled: true },
+                    { label: `Caption preset: ${captionPreset}`, enabled: true },
+                    { label: "Hook optimizer (spoiler hook)", enabled: hookOptimizer },
+                    { label: "Thumbnails automaticos", enabled: true },
                     { label: "Subtitulos karaoke", enabled: true },
                     { label: "Auto-titulo viral", enabled: autoTitle },
-                    { label: "Filtro anti-publicidad", enabled: smartMode },
-                    { label: "Corte por frase", enabled: smartMode },
+                    { label: "Duracion variable por contenido", enabled: true },
+                    { label: "Filtro anti-publicidad", enabled: true },
+                    { label: "Corte por frase", enabled: true },
                     { label: "Deteccion de escenas", enabled: true },
-                    { label: "Re-ranking GPT-4o", enabled: smartMode },
-                    { label: "Split-screen", enabled: splitScreen },
+                    { label: "Scoring multi-dimensional", enabled: true },
+                    { label: "Split-screen auto", enabled: splitScreen },
                   ].map(({ label, enabled }) => (
                     <div key={label} className="flex items-center justify-between">
                       <span className="text-(--muted-fg)">{label}</span>
@@ -626,9 +645,18 @@ export default function Home() {
                   Formato vertical 1080x1920 · optimizados para YouTube Shorts, TikTok e Instagram Reels
                 </p>
               </div>
-              <Badge variant="success" className="font-mono">
-                {response.clips.filter((c) => c.hasSubtitles).length}/{response.clips.length} subtitulos
-              </Badge>
+              <div className="flex items-center gap-2">
+                <Badge variant="success" className="font-mono">
+                  {response.clips.filter((c) => c.hasSubtitles).length}/{response.clips.length} subtitulos
+                </Badge>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => (window.location.href = `/editor?jobId=${encodeURIComponent(response.jobId)}`)}
+                >
+                  <Pencil className="mr-1 h-3.5 w-3.5" /> Editar clips
+                </Button>
+              </div>
             </div>
 
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -637,14 +665,22 @@ export default function Home() {
                   key={clip.fileName}
                   className="group overflow-hidden rounded-xl border border-(--line) bg-(--surface) transition-all hover:border-(--line-2) hover:shadow-[0_0_0_1px_rgba(124,58,237,0.2)]"
                 >
-                  {/* 9:16 player */}
+                  {/* 9:16 player with thumbnail poster */}
                   <div className="relative aspect-9/16 w-full bg-black">
                     <video
                       controls
                       preload="metadata"
                       className="absolute inset-0 h-full w-full object-contain"
                       src={clip.url}
+                      poster={clip.thumbnailUrl || undefined}
                     />
+                    {clip.hookApplied && (
+                      <div className="absolute top-2 left-2">
+                        <Badge className="bg-yellow-500/90 text-black text-[10px] font-bold border-0">
+                          <Zap className="mr-0.5 h-3 w-3" /> HOOK
+                        </Badge>
+                      </div>
+                    )}
                   </div>
 
                   {/* Metadata */}
@@ -659,22 +695,50 @@ export default function Home() {
                             SUB
                           </Badge>
                         )}
-                        {clip.score > 0 && (
+                        {clip.overallScore > 0 && (
                           <Badge variant="accent" className="font-mono text-[10px] py-0 px-1.5">
-                            {clip.score.toFixed(0)}pts
+                            {clip.overallScore}/100
                           </Badge>
                         )}
                       </div>
                     </div>
 
+                    {/* Multi-dimensional scores */}
+                    {clip.overallScore > 0 && (
+                      <div className="grid grid-cols-4 gap-1 text-[10px]">
+                        {(
+                          [
+                            { key: "hook" as const, label: "Hook" },
+                            { key: "flow" as const, label: "Flow" },
+                            { key: "engagement" as const, label: "Engage" },
+                            { key: "completeness" as const, label: "Compl" },
+                          ] as const
+                        ).map(({ key, label }) => {
+                          const v = clip.scores[key];
+                          const color =
+                            v >= 80
+                              ? "text-(--accent-2)"
+                              : v >= 60
+                                ? "text-yellow-400"
+                                : "text-(--muted-fg)";
+                          return (
+                            <div key={key} className="text-center">
+                              <span className="text-(--muted-fg) block">{label}</span>
+                              <span className={`font-mono font-bold ${color}`}>{v}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
                     <p className="font-mono text-xs text-(--muted-fg)">
-                      {clip.startSeconds.toFixed(1)}s &rarr;{" "}
-                      {(clip.startSeconds + clip.durationSeconds).toFixed(1)}s
+                      {formatSeconds(clip.startSeconds)} &rarr;{" "}
+                      {formatSeconds(clip.startSeconds + clip.durationSeconds)}
                       &nbsp;&middot;&nbsp;
-                      {clip.durationSeconds.toFixed(1)}s
+                      {clip.durationSeconds.toFixed(0)}s
                     </p>
 
-                    {clip.rationale && clip.rationale !== "corte uniforme" && (
+                    {clip.rationale && (
                       <p className="text-xs text-(--muted-fg) leading-5 line-clamp-2">
                         {clip.rationale}
                       </p>
@@ -685,6 +749,54 @@ export default function Home() {
                         <Download className="h-3.5 w-3.5" />
                         Descargar MP4
                       </a>
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Previous jobs history */}
+        {previousJobs.length > 0 && (
+          <section className="mt-10 space-y-4">
+            <div className="flex items-center gap-2">
+              <Clock className="h-4 w-4 text-(--muted-fg)" />
+              <h2 className="text-lg font-semibold">Jobs anteriores</h2>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {previousJobs.map((job) => (
+                <div
+                  key={job.jobId}
+                  className="flex items-center justify-between rounded-lg border border-(--line) bg-(--surface) px-4 py-3 hover:border-(--line-2) transition-colors"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium truncate">{job.sourceFileName}</p>
+                    <p className="text-xs text-(--muted-fg) mt-0.5">
+                      {job.clipCount} clips · {new Date(job.createdAt).toLocaleDateString()}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1.5 ml-3 shrink-0">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => (window.location.href = `/editor?jobId=${encodeURIComponent(job.jobId)}`)}
+                    >
+                      <Pencil className="mr-1 h-3 w-3" /> Editar
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="h-8 w-8 text-(--muted-fg) hover:text-red-400 hover:border-red-400/50"
+                      onClick={async () => {
+                        if (!confirm(`Eliminar job "${job.sourceFileName}" y todos sus clips?`)) return;
+                        try {
+                          await fetch(`/api/job/${encodeURIComponent(job.jobId)}`, { method: "DELETE" });
+                          setPreviousJobs((prev) => prev.filter((j) => j.jobId !== job.jobId));
+                        } catch { /* ignore */ }
+                      }}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
                     </Button>
                   </div>
                 </div>
