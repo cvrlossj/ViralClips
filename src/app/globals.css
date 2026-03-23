@@ -2,25 +2,25 @@
 
 :root {
   /* Core */
-  --background: #09090b;
-  --foreground: #f4f4f5;
+  --background: #fafafa;
+  --foreground: #18181b;
 
   /* Surfaces */
-  --surface: #111116;
-  --surface-2: #1c1c24;
-  --surface-3: #252530;
+  --surface: #ffffff;
+  --surface-2: #f4f4f5;
+  --surface-3: #e4e4e7;
 
   /* Borders */
-  --line: #2d2d38;
-  --line-2: #3d3d4d;
+  --line: #e4e4e7;
+  --line-2: #d4d4d8;
 
   /* Brand accent — violet */
   --accent: #7c3aed;
   --accent-hover: #6d28d9;
-  --accent-fg: #f5f3ff;
+  --accent-fg: #ffffff;
 
   /* Success accent — emerald */
-  --accent-2: #10b981;
+  --accent-2: #059669;
   --accent-2-fg: #ecfdf5;
 
   /* Muted */
@@ -47,19 +47,19 @@ body {
   border-color: var(--line);
 }
 
-/* Subtle grain + violet ambient glow */
+/* Subtle grain + violet ambient glow (soft for light mode) */
 .grain {
   background-image:
-    radial-gradient(ellipse at 20% 0%, rgba(124, 58, 237, 0.18), transparent 55%),
-    radial-gradient(ellipse at 80% 0%, rgba(99, 102, 241, 0.08), transparent 45%),
-    radial-gradient(ellipse at 50% 100%, rgba(124, 58, 237, 0.06), transparent 40%);
+    radial-gradient(ellipse at 20% 0%, rgba(124, 58, 237, 0.06), transparent 55%),
+    radial-gradient(ellipse at 80% 0%, rgba(99, 102, 241, 0.04), transparent 45%),
+    radial-gradient(ellipse at 50% 100%, rgba(124, 58, 237, 0.03), transparent 40%);
 }
 
 /* Glow effect on primary button */
 .btn-glow {
-  box-shadow: 0 0 20px rgba(124, 58, 237, 0.4), 0 0 40px rgba(124, 58, 237, 0.15);
+  box-shadow: 0 0 16px rgba(124, 58, 237, 0.25), 0 0 32px rgba(124, 58, 237, 0.1);
 }
 
 .btn-glow:hover {
-  box-shadow: 0 0 28px rgba(124, 58, 237, 0.55), 0 0 50px rgba(124, 58, 237, 0.2);
+  box-shadow: 0 0 24px rgba(124, 58, 237, 0.35), 0 0 48px rgba(124, 58, 237, 0.15);
 }
