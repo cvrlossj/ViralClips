@@ -2,23 +2,35 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import {
-  buildCandidateWindows,
+  buildHeuristicMoments,
   detectAdSegments,
+  detectMomentsWithLlm,
   detectSceneChangeTimes,
-  isWindowInAdSegment,
-  pickHeuristicWindows,
-  rerankWithLlm,
-  type AdSegment,
+  type ClipScores,
+  type DetectedMoment,
 } from "@/lib/clip-ranking";
 import {
   ensurePathForSubtitlesFilter,
   ensureTextForDrawText,
   extractCompressedAudio,
+  extractKeyframes,
   getMediaDimensions,
   getMediaDurationSeconds,
   runFfmpeg,
 } from "@/lib/ffmpeg";
-import { outputDir, tempDir, uploadDir } from "@/lib/paths";
+import { framesDir, jobsDir, outputDir, sourcesDir, tempDir, uploadDir } from "@/lib/paths";
+import {
+  analyzeVideoVisually,
+  buildVisualContextForPrompt,
+  type VisualAnalysisResult,
+} from "@/lib/visual-analysis";
+import {
+  getPreset,
+  wordsToPresetAss,
+  srtToPresetAss,
+  DEFAULT_PRESET_ID,
+  type CaptionPreset,
+} from "@/lib/caption-presets";
 import OpenAI from "openai";
 import {
   canTranscribe,
@@ -40,22 +52,27 @@ type PipelineInput = {
   title: string;
   watermark: string;
   clipCount: number;
-  clipDuration: number;
-  smartMode: boolean;
   subtitleSize: number;
   splitScreen: boolean;
   autoTitle: boolean;
+  /** Caption preset ID (e.g. "hormozi", "mrbeast") */
+  captionPreset: string;
+  /** Enable hook optimizer (spoiler hook at start) */
+  hookOptimizer: boolean;
 };
 
-type ClipResult = {
+export type ClipResult = {
   fileName: string;
   url: string;
   startSeconds: number;
   durationSeconds: number;
   hasSubtitles: boolean;
-  score: number;
+  scores: ClipScores;
+  overallScore: number;
   rationale: string;
   title: string;
+  thumbnailUrl?: string;
+  hookApplied?: boolean;
 };
 
 type PipelineResult = {
@@ -64,9 +81,26 @@ type PipelineResult = {
   notes: string[];
 };
 
-type ScoreInfo = {
-  score: number;
-  rationale: string;
+export type JobManifest = {
+  jobId: string;
+  sourceVideoPath: string;
+  sourceFileName: string;
+  clips: ClipResult[];
+  words: TranscriptWord[];
+  visualAnalysis?: {
+    summary: string;
+    hotSpots: { start: number; end: number; reason: string }[];
+    signalCount: number;
+  };
+  settings: {
+    watermark: string;
+    subtitleSize: number;
+    splitScreen: boolean;
+    captionPreset: string;
+    hookOptimizer: boolean;
+  };
+  notes: string[];
+  createdAt: string;
 };
 
 const clipVideoPreset = process.env.CLIP_VIDEO_PRESET ?? "medium";
@@ -82,6 +116,9 @@ async function ensureStorageFolders() {
     fs.mkdir(uploadDir, { recursive: true }),
     fs.mkdir(outputDir, { recursive: true }),
     fs.mkdir(tempDir, { recursive: true }),
+    fs.mkdir(sourcesDir, { recursive: true }),
+    fs.mkdir(jobsDir, { recursive: true }),
+    fs.mkdir(framesDir, { recursive: true }),
   ]);
 }
 
@@ -171,161 +208,9 @@ function snapToSentenceBoundary(
 }
 
 // ---------------------------------------------------------------------------
-// ASS subtitle generation — karaoke word-by-word highlighting
+// ASS subtitle generation — now uses caption presets from caption-presets.ts
+// The old hardcoded ASS functions have been replaced by the preset system.
 // ---------------------------------------------------------------------------
-// Groups words into lines of WORDS_PER_LINE, then creates one ASS Dialogue
-// per word showing the full line with the current word highlighted in yellow
-// and the rest in white.
-// ---------------------------------------------------------------------------
-
-const WORDS_PER_LINE = 3;
-
-function assTime(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  const cs = Math.floor((seconds * 100) % 100);
-  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
-}
-
-function wordsToKaraokeAss(words: TranscriptWord[], fontSize: number): string {
-  if (words.length === 0) return "";
-
-  // Group words into lines
-  const lines: TranscriptWord[][] = [];
-  for (let i = 0; i < words.length; i += WORDS_PER_LINE) {
-    lines.push(words.slice(i, i + WORDS_PER_LINE));
-  }
-
-  const dialogues: string[] = [];
-
-  for (const line of lines) {
-    const lineStart = line[0].start;
-    const lineEnd = line[line.length - 1].end;
-
-    // For each word in the line, create a dialogue event that shows the full
-    // line but highlights the current word.
-    for (let wi = 0; wi < line.length; wi++) {
-      const w = line[wi];
-      const wordStart = w.start;
-      const wordEnd = wi < line.length - 1 ? line[wi + 1].start : lineEnd;
-
-      // Build text with override tags
-      const parts = line.map((lw, li) => {
-        const clean = lw.word.replace(/\\/g, "");
-        if (li === wi) {
-          // Current word: yellow highlight (ASS uses BGR: 00FFFF = yellow)
-          return `{\\1c&H00FFFF&\\b1}${clean}{\\1c&HFFFFFF&\\b1}`;
-        }
-        return clean;
-      });
-
-      dialogues.push(
-        `Dialogue: 0,${assTime(wordStart)},${assTime(wordEnd)},Default,,0,0,0,,${parts.join(" ")}`,
-      );
-    }
-  }
-
-  const styleLine = [
-    "Default",
-    "Arial",
-    String(fontSize),
-    "&H00FFFFFF",       // PrimaryColour (white)
-    "&H000000FF",       // SecondaryColour
-    "&H00000000",       // OutlineColour (black)
-    "&H80000000",       // BackColour (semi-transparent black)
-    "-1",               // Bold
-    "0",                // Italic
-    "0",                // Underline
-    "0",                // StrikeOut
-    "100",              // ScaleX
-    "100",              // ScaleY
-    "0",                // Spacing
-    "0",                // Angle
-    "1",                // BorderStyle (outline + shadow)
-    "4",                // Outline thickness
-    "2",                // Shadow depth
-    "2",                // Alignment (bottom-center)
-    "20",               // MarginL
-    "20",               // MarginR
-    "130",              // MarginV (from bottom)
-    "1",                // Encoding
-  ].join(",");
-
-  return [
-    "[Script Info]",
-    "ScriptType: v4.00+",
-    "PlayResX: 1080",
-    "PlayResY: 1920",
-    "WrapStyle: 0",
-    "",
-    "[V4+ Styles]",
-    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-    `Style: ${styleLine}`,
-    "",
-    "[Events]",
-    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-    ...dialogues,
-    "",
-  ].join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// Fallback: SRT → ASS conversion (used when word timestamps are unavailable)
-// ---------------------------------------------------------------------------
-
-function srtTimeToAss(srtTime: string): string {
-  const m = srtTime.match(/(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/);
-  if (!m) return "0:00:00.00";
-  return `${parseInt(m[1])}:${m[2]}:${m[3]}.${m[4].slice(0, 2)}`;
-}
-
-function srtToAss(srt: string, fontSize: number): string {
-  const blocks = srt.trim().split(/\r?\n\r?\n+/);
-  const dialogues: string[] = [];
-
-  for (const block of blocks) {
-    const lines = block.trim().split(/\r?\n/);
-    if (lines.length < 3) continue;
-
-    const timeMatch = lines[1]?.match(
-      /(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/,
-    );
-    if (!timeMatch) continue;
-
-    const start = srtTimeToAss(timeMatch[1]);
-    const end = srtTimeToAss(timeMatch[2]);
-    const text = lines.slice(2).join("\\N");
-
-    dialogues.push(`Dialogue: 0,${start},${end},Default,,0,0,0,,${text}`);
-  }
-
-  const styleLine = [
-    "Default", "Arial", String(fontSize),
-    "&H00FFFFFF", "&H000000FF", "&H00000000", "&H80000000",
-    "-1", "0", "0", "0",
-    "100", "100", "0", "0",
-    "1", "4", "2",
-    "2", "20", "20", "130", "1",
-  ].join(",");
-
-  return [
-    "[Script Info]",
-    "ScriptType: v4.00+",
-    "PlayResX: 1080",
-    "PlayResY: 1920",
-    "WrapStyle: 0",
-    "",
-    "[V4+ Styles]",
-    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-    `Style: ${styleLine}`,
-    "",
-    "[Events]",
-    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-    ...dialogues,
-    "",
-  ].join("\n");
-}
 
 // ---------------------------------------------------------------------------
 // Auto-generated viral titles per clip
@@ -396,8 +281,9 @@ async function transcribeClipAudio(params: {
   start: number;
   durationForClip: number;
   subtitleFontSize: number;
+  captionPreset: CaptionPreset;
 }): Promise<{ hasSubtitles: boolean; subtitlePath: string; isKaraoke: boolean }> {
-  const { uploadFilePath, jobId, index, start, durationForClip, subtitleFontSize } = params;
+  const { uploadFilePath, jobId, index, start, durationForClip, subtitleFontSize, captionPreset } = params;
   const subtitlePath = path.join(tempDir, `${jobId}_clip_${index + 1}.ass`);
 
   if (!canTranscribe()) return { hasSubtitles: false, subtitlePath, isKaraoke: false };
@@ -415,11 +301,11 @@ async function transcribeClipAudio(params: {
       tempAudioPath,
     ]);
 
-    // Try word-level transcription first (karaoke)
+    // Try word-level transcription first (karaoke with preset)
     try {
       const words = await transcribeWords(tempAudioPath);
       if (words.length > 0) {
-        const ass = wordsToKaraokeAss(words, subtitleFontSize);
+        const ass = wordsToPresetAss(words, subtitleFontSize, captionPreset);
         await fs.writeFile(subtitlePath, ass, "utf-8");
         await fs.rm(tempAudioPath, { force: true });
         return { hasSubtitles: true, subtitlePath, isKaraoke: true };
@@ -428,9 +314,9 @@ async function transcribeClipAudio(params: {
       // Word-level failed, fall back to SRT-based
     }
 
-    // Fallback: SRT-based subtitles
+    // Fallback: SRT-based subtitles with preset
     const srt = await transcribeToSrt(tempAudioPath);
-    const ass = srtToAss(srt, subtitleFontSize);
+    const ass = srtToPresetAss(srt, subtitleFontSize, captionPreset);
     await fs.writeFile(subtitlePath, ass, "utf-8");
     await fs.rm(tempAudioPath, { force: true });
 
@@ -438,6 +324,245 @@ async function transcribeClipAudio(params: {
   } catch {
     return { hasSubtitles: false, subtitlePath, isKaraoke: false };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Single clip renderer — used by both the main pipeline and re-render API
+// ---------------------------------------------------------------------------
+
+export async function renderSingleClip(params: {
+  sourceVideoPath: string;
+  outputPath: string;
+  start: number;
+  duration: number;
+  title: string;
+  watermark: string;
+  subtitlePath: string | null;
+  splitScreen: boolean;
+  srcWidth: number;
+  srcHeight: number;
+}): Promise<void> {
+  const { sourceVideoPath, outputPath, start, duration, title, watermark, subtitlePath, splitScreen } = params;
+  const safeTitle = ensureTextForDrawText(title);
+  const safeWatermark = ensureTextForDrawText(watermark);
+
+  const HEADER_H = 200;
+  const FOOTER_H = 180;
+  const VIDEO_H = 1920 - HEADER_H;
+
+  const isLandscape = params.srcWidth > params.srcHeight && params.srcWidth > 0;
+  const applySplit = splitScreen && isLandscape;
+
+  if (applySplit) {
+    const halfH = Math.floor(VIDEO_H / 2);
+
+    const overlayFilters = [
+      `drawbox=x=0:y=h-${FOOTER_H}:w=iw:h=${FOOTER_H}:color=black@0.50:t=fill`,
+      `drawbox=x=0:y=${HEADER_H + halfH - 2}:w=iw:h=4:color=white@0.3:t=fill`,
+      `drawtext=text='${safeTitle}':font=Arial:fontcolor=white:fontsize=44:x=(w-text_w)/2:y=${Math.floor(HEADER_H / 2 - 22)}`,
+      `drawtext=text='${safeWatermark}':font=Arial:fontcolor=white@0.90:fontsize=34:x=(w-text_w)/2:y=h-th-55`,
+    ];
+    if (subtitlePath) {
+      overlayFilters.push(`subtitles='${ensurePathForSubtitlesFilter(subtitlePath)}'`);
+    }
+
+    const filterComplex = [
+      `[0:v]split[a][b]`,
+      `[a]crop=iw/2:ih:0:0,scale=1080:${halfH}[left]`,
+      `[b]crop=iw/2:ih:iw/2:0,scale=1080:${halfH}[right]`,
+      `[left][right]vstack,pad=1080:1920:0:${HEADER_H}:black,${overlayFilters.join(",")}[out]`,
+    ].join(";");
+
+    await runFfmpeg([
+      "-y", "-ss", start.toFixed(2), "-t", duration.toFixed(2),
+      "-i", sourceVideoPath,
+      "-filter_complex", filterComplex,
+      "-map", "[out]", "-map", "0:a?",
+      "-c:v", "libx264", "-preset", clipVideoPreset, "-crf", clipVideoCrf,
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-b:a", clipAudioBitrate,
+      "-movflags", "+faststart",
+      outputPath,
+    ]);
+  } else {
+    const filters: string[] = [
+      `drawbox=x=0:y=h-${FOOTER_H}:w=iw:h=${FOOTER_H}:color=black@0.50:t=fill`,
+    ];
+    if (subtitlePath) {
+      filters.push(`subtitles='${ensurePathForSubtitlesFilter(subtitlePath)}'`);
+    }
+    filters.push(
+      `drawtext=text='${safeTitle}':font=Arial:fontcolor=white:fontsize=44:x=(w-text_w)/2:y=${Math.floor(HEADER_H / 2 - 22)}`,
+    );
+    filters.push(
+      `drawtext=text='${safeWatermark}':font=Arial:fontcolor=white@0.90:fontsize=34:x=(w-text_w)/2:y=h-th-55`,
+    );
+
+    await runFfmpeg([
+      "-y", "-ss", start.toFixed(2), "-t", duration.toFixed(2),
+      "-i", sourceVideoPath,
+      "-vf", `scale=1080:${VIDEO_H}:force_original_aspect_ratio=increase,crop=1080:${VIDEO_H},pad=1080:1920:0:${HEADER_H}:black,${filters.join(",")}`,
+      "-c:v", "libx264", "-preset", clipVideoPreset, "-crf", clipVideoCrf,
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-b:a", clipAudioBitrate,
+      "-movflags", "+faststart",
+      outputPath,
+    ]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hook Optimizer — "Spoiler Hook" technique
+// ---------------------------------------------------------------------------
+// MrBeast/Hormozi technique: show the most impactful 2-3 seconds FIRST,
+// then flash "moments before..." text, then play the full clip from start.
+// This grabs attention immediately and makes viewers stay to see the context.
+// ---------------------------------------------------------------------------
+
+async function applyHookOptimizer(params: {
+  clipPath: string;
+  sourceVideoPath: string;
+  clipStart: number;
+  clipDuration: number;
+  visualSignals: { timestamp: number; viralPotential: number; energy: string }[];
+  words: TranscriptWord[];
+  jobId: string;
+  clipIndex: number;
+}): Promise<boolean> {
+  const { clipPath, clipStart, clipDuration, visualSignals, words, jobId, clipIndex } = params;
+
+  // Find the "peak moment" — highest visual energy within the clip range
+  const clipEnd = clipStart + clipDuration;
+  const clipSignals = visualSignals.filter(
+    (s) => s.timestamp >= clipStart && s.timestamp <= clipEnd,
+  );
+
+  // Use visual signals if available, otherwise find an exclamation/hook word
+  let peakTimeInClip = clipDuration * 0.6; // default: 60% into clip
+
+  if (clipSignals.length > 0) {
+    const peak = clipSignals.reduce((best, s) =>
+      s.viralPotential > best.viralPotential ? s : best,
+    );
+    peakTimeInClip = peak.timestamp - clipStart;
+  } else if (words.length > 0) {
+    // Find exclamation/reaction words in the clip
+    const hookPatterns = /(!|jaja|wow|no\s+puede|increible|mira|que\s+paso|loco|brutal|wait|what|oh\s+my)/i;
+    const clipWords = words.filter((w) => w.start >= clipStart && w.end <= clipEnd);
+    const hookWord = clipWords.find((w) => hookPatterns.test(w.word));
+    if (hookWord) {
+      peakTimeInClip = hookWord.start - clipStart;
+    }
+  }
+
+  // Don't hook if the peak is in the first 5 seconds (already a good hook)
+  if (peakTimeInClip < 5) return false;
+  // Don't hook if peak is in the last 3 seconds
+  if (peakTimeInClip > clipDuration - 3) return false;
+
+  const hookDuration = 2.5; // seconds of the "spoiler" clip
+  const hookStart = Math.max(0, peakTimeInClip - 0.5); // start slightly before peak
+
+  // Paths for temporary segments
+  const hookSegPath = path.join(tempDir, `${jobId}_hook_${clipIndex}.mp4`);
+  const transitionPath = path.join(tempDir, `${jobId}_transition_${clipIndex}.mp4`);
+  const concatListPath = path.join(tempDir, `${jobId}_concat_${clipIndex}.txt`);
+  const outputTempPath = path.join(tempDir, `${jobId}_hooked_${clipIndex}.mp4`);
+
+  try {
+    // 1. Extract the hook segment (2.5s of the peak moment from rendered clip)
+    await runFfmpeg([
+      "-y",
+      "-ss", hookStart.toFixed(2),
+      "-t", hookDuration.toFixed(2),
+      "-i", clipPath,
+      "-c:v", "libx264", "-preset", "fast", "-crf", clipVideoCrf,
+      "-c:a", "aac", "-b:a", clipAudioBitrate,
+      "-pix_fmt", "yuv420p",
+      hookSegPath,
+    ]);
+
+    // 2. Create a brief transition frame (0.8s black with text "Momentos antes...")
+    await runFfmpeg([
+      "-y",
+      "-f", "lavfi",
+      "-i", `color=c=black:s=1080x1920:d=0.8,drawtext=text='Momentos antes...':font=Arial:fontcolor=white@0.85:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2`,
+      "-f", "lavfi",
+      "-i", "anullsrc=r=44100:cl=stereo",
+      "-t", "0.8",
+      "-c:v", "libx264", "-preset", "fast", "-crf", clipVideoCrf,
+      "-c:a", "aac", "-b:a", clipAudioBitrate,
+      "-pix_fmt", "yuv420p",
+      "-shortest",
+      transitionPath,
+    ]);
+
+    // 3. Concatenate: hook + transition + full clip
+    const concatContent = [
+      `file '${hookSegPath.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`,
+      `file '${transitionPath.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`,
+      `file '${clipPath.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`,
+    ].join("\n");
+    await fs.writeFile(concatListPath, concatContent, "utf-8");
+
+    await runFfmpeg([
+      "-y",
+      "-f", "concat",
+      "-safe", "0",
+      "-i", concatListPath,
+      "-c:v", "libx264", "-preset", clipVideoPreset, "-crf", clipVideoCrf,
+      "-c:a", "aac", "-b:a", clipAudioBitrate,
+      "-pix_fmt", "yuv420p",
+      "-movflags", "+faststart",
+      outputTempPath,
+    ]);
+
+    // 4. Replace original clip with hooked version
+    await fs.rename(outputTempPath, clipPath).catch(async () => {
+      await fs.copyFile(outputTempPath, clipPath);
+      await fs.rm(outputTempPath, { force: true });
+    });
+
+    return true;
+  } catch {
+    return false;
+  } finally {
+    // Clean up temp files
+    await Promise.all([
+      fs.rm(hookSegPath, { force: true }).catch(() => {}),
+      fs.rm(transitionPath, { force: true }).catch(() => {}),
+      fs.rm(concatListPath, { force: true }).catch(() => {}),
+      fs.rm(outputTempPath, { force: true }).catch(() => {}),
+    ]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Preview Frame / Thumbnail — extract the most engaging frame
+// ---------------------------------------------------------------------------
+// Uses visual analysis signals to find the highest-energy frame.
+// Falls back to the "golden moment" at ~40% into the clip.
+// ---------------------------------------------------------------------------
+
+function findBestThumbnailTime(
+  clipStart: number,
+  clipEnd: number,
+  visualSignals: { timestamp: number; viralPotential: number }[],
+): number {
+  const clipSignals = visualSignals.filter(
+    (s) => s.timestamp >= clipStart && s.timestamp <= clipEnd,
+  );
+
+  if (clipSignals.length > 0) {
+    // Pick the frame with highest viral potential
+    const best = clipSignals.reduce((a, b) =>
+      a.viralPotential > b.viralPotential ? a : b,
+    );
+    return best.timestamp;
+  }
+
+  // Fallback: 40% into the clip (past the intro, before the outro)
+  return clipStart + (clipEnd - clipStart) * 0.4;
 }
 
 // ---------------------------------------------------------------------------
@@ -462,42 +587,31 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
 
   try {
     const duration = await getMediaDurationSeconds(uploadFilePath);
-    let starts = buildStarts(duration, input.clipCount, input.clipDuration);
-    let scoreMap = new Map<number, ScoreInfo>();
-
-    const fallbackTitle = input.title.trim() || "Clip viral";
-    const safeWatermark = ensureTextForDrawText(input.watermark.trim() || "@viralclips");
-
-    let transcriptSegmentsCount = 0;
-    let sceneChanges: number[] = [];
-    let usedLlmRerank = false;
-    let usedSentenceSnap = false;
-    let autoTitlesGenerated = 0;
     const diagnostics: string[] = [];
 
-    // Full-video word timestamps for sentence-boundary snapping
+    const fallbackTitle = input.title.trim() || "Clip viral";
+
+    // Full-video word timestamps for karaoke subtitles
     let fullVideoWords: TranscriptWord[] = [];
 
-    // Detect if video is landscape for split-screen
-    let isLandscape = false;
+    // Detect video dimensions — auto split-screen for landscape videos
     let srcWidth = 0;
     let srcHeight = 0;
-    if (input.splitScreen) {
-      try {
-        const dims = await getMediaDimensions(uploadFilePath);
-        srcWidth = dims.width;
-        srcHeight = dims.height;
-        isLandscape = dims.width > dims.height;
-      } catch {
-        diagnostics.push("No se pudieron leer las dimensiones del video; split-screen desactivado.");
-      }
+    try {
+      const dims = await getMediaDimensions(uploadFilePath);
+      srcWidth = dims.width;
+      srcHeight = dims.height;
+    } catch {
+      diagnostics.push("No se pudieron leer las dimensiones del video.");
     }
-    const applySplitScreen = input.splitScreen && isLandscape && srcWidth > 0;
+    const isLandscape = srcWidth > srcHeight && srcWidth > 0;
+    // Auto split-screen: apply when video is landscape (16:9, podcast, etc.)
+    // Users can force it off via the splitScreen toggle
+    const applySplitScreen = isLandscape && (input.splitScreen !== false);
 
     // Extract compressed audio once — used for full-video transcription
-    // Whisper API has a 25MB limit; this reduces multi-GB videos to a few MB.
     let fullAudioExtracted = false;
-    if (input.smartMode && canTranscribe()) {
+    if (canTranscribe()) {
       try {
         await extractCompressedAudio(uploadFilePath, fullAudioPath);
         fullAudioExtracted = true;
@@ -506,171 +620,183 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
       }
     }
 
-    if (input.smartMode) {
-      let transcriptSegments = [] as Awaited<ReturnType<typeof transcribeVerbose>>["segments"];
+    // Phase 0: Transcription + Scene detection + Keyframe extraction (parallel)
+    let transcriptSegments = [] as Awaited<ReturnType<typeof transcribeVerbose>>["segments"];
+    let sceneChanges: number[] = [];
+    let keyframes: { path: string; timestamp: number }[] = [];
 
-      if (canTranscribe() && fullAudioExtracted) {
-        try {
-          const verboseResult = await transcribeVerbose(fullAudioPath);
-          transcriptSegments = verboseResult.segments;
-          transcriptSegmentsCount = transcriptSegments.length;
-          fullVideoWords = verboseResult.words;
-        } catch (error) {
-          diagnostics.push(
-            error instanceof Error
-              ? `Transcripcion avanzada fallida: ${error.message}`
-              : "Transcripcion avanzada fallida.",
-          );
-        }
-      }
+    // Calculate keyframe interval: ~1 frame every 5s for short videos, 8s for long ones
+    const keyframeInterval = duration > 600 ? 8 : 5;
+    const maxKeyframes = Math.min(60, Math.ceil(duration / keyframeInterval));
 
-      try {
-        sceneChanges = await detectSceneChangeTimes(uploadFilePath, duration);
-      } catch (error) {
-        diagnostics.push(
-          error instanceof Error
-            ? `Deteccion de escenas fallida: ${error.message}`
-            : "Deteccion de escenas fallida.",
-        );
-        sceneChanges = [];
-      }
+    const [transcriptResult, sceneResult, keyframeResult] = await Promise.allSettled([
+      canTranscribe() && fullAudioExtracted
+        ? transcribeVerbose(fullAudioPath)
+        : Promise.resolve(null),
+      detectSceneChangeTimes(uploadFilePath, duration),
+      canTranscribe()
+        ? extractKeyframes({
+            inputPath: uploadFilePath,
+            outputDir: framesDir,
+            jobId,
+            intervalSeconds: keyframeInterval,
+            maxFrames: maxKeyframes,
+          })
+        : Promise.resolve([]),
+    ]);
 
-      // Detect ad/sponsor segments to exclude from clip selection
-      let adSegments: AdSegment[] = [];
-      if (transcriptSegments.length > 0) {
-        adSegments = detectAdSegments(transcriptSegments);
-        if (adSegments.length > 0) {
-          diagnostics.push(
-            `Segmentos de publicidad detectados: ${adSegments.length} (excluidos de la seleccion).`,
-          );
-        }
-      }
-
-      if (transcriptSegments.length > 0 || sceneChanges.length > 0) {
-        const allCandidates = buildCandidateWindows({
-          duration,
-          clipDuration: input.clipDuration,
-          segments: transcriptSegments,
-          sceneChanges,
-        });
-
-        // Filter out candidates that overlap with ad segments
-        const candidates = adSegments.length > 0
-          ? allCandidates.filter(
-              (c) => !isWindowInAdSegment(c.start, input.clipDuration, adSegments),
-            )
-          : allCandidates;
-
-        const heuristic = pickHeuristicWindows({
-          candidates,
-          clipCount: input.clipCount,
-          clipDuration: input.clipDuration,
-        });
-
-        let selected = heuristic;
-        const reranked = await rerankWithLlm({
-          candidates,
-          clipCount: input.clipCount,
-          clipDuration: input.clipDuration,
-        });
-
-        if (reranked && reranked.length > 0) {
-          selected = reranked;
-          usedLlmRerank = true;
-        }
-
-        if (selected.length > 0) {
-          starts = selected.map((item) => item.start).sort((a, b) => a - b);
-          scoreMap = new Map<number, ScoreInfo>();
-          selected.forEach((item) => {
-            scoreMap.set(Number(item.start.toFixed(2)), {
-              score: item.score,
-              rationale: item.rationale,
-            });
-          });
-        }
-      }
+    if (transcriptResult.status === "fulfilled" && transcriptResult.value) {
+      transcriptSegments = transcriptResult.value.segments;
+      fullVideoWords = transcriptResult.value.words;
+    } else if (transcriptResult.status === "rejected") {
+      diagnostics.push(`Transcripcion fallida: ${transcriptResult.reason?.message ?? "error desconocido"}`);
     }
 
-    // Apply sentence-boundary snapping if we have word timestamps
-    if (fullVideoWords.length > 0) {
-      const snappedStarts = starts.map((rawStart) => {
-        const rawEnd = rawStart + input.clipDuration;
-        const snapped = snapToSentenceBoundary(fullVideoWords, rawStart, rawEnd);
-        return snapped.start;
+    if (sceneResult.status === "fulfilled") {
+      sceneChanges = sceneResult.value;
+    }
+
+    if (keyframeResult.status === "fulfilled") {
+      keyframes = keyframeResult.value;
+    } else {
+      diagnostics.push("Extraccion de keyframes fallida.");
+    }
+
+    // Phase 1: Detect viral moments (LLM-first, heuristic fallback)
+    const adSegments = transcriptSegments.length > 0
+      ? detectAdSegments(transcriptSegments)
+      : [];
+
+    if (adSegments.length > 0) {
+      diagnostics.push(`Segmentos de publicidad detectados: ${adSegments.length} (excluidos).`);
+    }
+
+    // Phase 1.5: Visual analysis with GPT-4o Vision (if keyframes available)
+    let visualAnalysis: VisualAnalysisResult | null = null;
+    let visualContextStr = "";
+
+    if (keyframes.length > 0 && canTranscribe()) {
+      const transcriptForVisual = transcriptSegments
+        .map((s) => `[${Math.floor(s.start / 60)}:${String(Math.floor(s.start % 60)).padStart(2, "0")}] ${s.text}`)
+        .join("\n");
+
+      visualAnalysis = await analyzeVideoVisually({
+        frames: keyframes,
+        transcriptContext: transcriptForVisual,
+        videoDuration: duration,
       });
 
-      // Deduplicate: if snapping collapsed multiple starts to the same point,
-      // keep the first and revert duplicates to their original positions.
-      const minGap = input.clipDuration * 0.8;
-      const finalStarts: number[] = [];
-      for (let i = 0; i < snappedStarts.length; i++) {
-        const candidate = snappedStarts[i];
-        const tooClose = finalStarts.some(
-          (prev) => Math.abs(prev - candidate) < minGap,
+      if (visualAnalysis) {
+        visualContextStr = buildVisualContextForPrompt(visualAnalysis);
+        diagnostics.push(
+          `Analisis visual: ${visualAnalysis.signals.length} frames analizados, ${visualAnalysis.hotSpots.length} zonas calientes.`,
         );
-        if (tooClose) {
-          // Revert to original start, shifted slightly to avoid exact overlap
-          const fallback = starts[i];
-          const fallbackTooClose = finalStarts.some(
-            (prev) => Math.abs(prev - fallback) < minGap,
-          );
-          if (!fallbackTooClose) {
-            finalStarts.push(fallback);
-          }
-          // If even the original overlaps, skip this clip entirely
-        } else {
-          finalStarts.push(candidate);
-        }
+      } else {
+        diagnostics.push("Analisis visual no produjo resultados.");
       }
-
-      starts = finalStarts.length > 0 ? finalStarts : starts;
-      usedSentenceSnap = true;
     }
 
-    // Final safety: deduplicate any starts that ended up too close together
-    {
-      const safeGap = input.clipDuration * 0.5;
-      const deduped: number[] = [];
-      const sorted = [...starts].sort((a, b) => a - b);
-      for (const s of sorted) {
-        if (deduped.length === 0 || s - deduped[deduped.length - 1] >= safeGap) {
-          deduped.push(s);
-        }
-      }
-      starts = deduped;
+    // Clean up keyframe files
+    for (const kf of keyframes) {
+      await fs.rm(kf.path, { force: true }).catch(() => {});
     }
 
-    const fontSize = Math.max(16, Math.min(40, input.subtitleSize));
+    let moments: DetectedMoment[] = [];
+    let usedLlmDetection = false;
 
-    const clipsData = starts.map((start, i) => ({
-      start,
-      durationForClip: Math.min(input.clipDuration, Math.max(duration - start, 1)),
+    if (transcriptSegments.length > 0) {
+      // Try LLM-first moment detection (with visual context if available)
+      const llmMoments = await detectMomentsWithLlm({
+        segments: transcriptSegments,
+        sceneChanges,
+        adSegments,
+        videoDuration: duration,
+        maxClips: input.clipCount,
+        visualContext: visualContextStr || undefined,
+      });
+
+      if (llmMoments && llmMoments.length > 0) {
+        moments = llmMoments;
+        usedLlmDetection = true;
+      } else {
+        // Fallback to heuristic moment detection
+        moments = buildHeuristicMoments({
+          segments: transcriptSegments,
+          sceneChanges,
+          adSegments,
+          videoDuration: duration,
+          maxClips: input.clipCount,
+        });
+      }
+    }
+
+    // If no moments detected (no transcript), fall back to uniform distribution
+    if (moments.length === 0) {
+      const defaultDuration = 30;
+      const starts = buildStarts(duration, input.clipCount, defaultDuration);
+      moments = starts.map((start) => ({
+        start,
+        end: Math.min(start + defaultDuration, duration),
+        title: fallbackTitle,
+        scores: { hook: 0, flow: 0, engagement: 0, completeness: 0 },
+        overallScore: 0,
+        rationale: "Sin transcripcion — distribucion temporal uniforme.",
+        transcriptPreview: "",
+      }));
+    }
+
+    // Apply sentence-boundary snapping to LLM moments
+    if (fullVideoWords.length > 0) {
+      moments = moments.map((m) => {
+        const snapped = snapToSentenceBoundary(fullVideoWords, m.start, m.end);
+        // Only apply if the snapped range is still reasonable
+        const snappedDuration = snapped.end - snapped.start;
+        if (snappedDuration >= 10 && snappedDuration <= 180) {
+          return { ...m, start: snapped.start, end: snapped.end };
+        }
+        return m;
+      });
+    }
+
+    // Sort moments by score (best first for display), then process
+    moments.sort((a, b) => b.overallScore - a.overallScore);
+
+    const fontSize = Math.max(24, Math.min(56, input.subtitleSize));
+    const captionPreset = getPreset(input.captionPreset || DEFAULT_PRESET_ID);
+
+    const clipsData = moments.map((m, i) => ({
+      moment: m,
+      durationForClip: Number((m.end - m.start).toFixed(2)),
       index: i,
     }));
 
-    // Phase 1: Transcribe ALL clips in parallel (I/O-bound API calls)
+    // Phase 2: Transcribe ALL clips in parallel (I/O-bound API calls)
     const transcriptionResults = await Promise.allSettled(
-      clipsData.map(({ start, durationForClip, index }) =>
+      clipsData.map(({ moment, durationForClip, index }) =>
         transcribeClipAudio({
           uploadFilePath,
           jobId,
           index,
-          start,
+          start: moment.start,
           durationForClip,
           subtitleFontSize: fontSize,
+          captionPreset,
         }),
       ),
     );
 
-    // Phase 1.5: Auto-generate viral titles per clip (parallel API calls)
+    // Phase 2.5: Generate viral titles if LLM didn't provide them, or if autoTitle is on
     let clipTitles: string[] = [];
     if (input.autoTitle && fullVideoWords.length > 0 && titleClient) {
-      const titlePromises = clipsData.map(({ start, durationForClip }) => {
+      // Only generate titles for clips that don't already have LLM-generated ones
+      const titlePromises = clipsData.map(({ moment }) => {
+        if (usedLlmDetection && moment.title && moment.title !== "Clip viral") {
+          return Promise.resolve(moment.title);
+        }
         const transcript = extractClipTranscript(
           fullVideoWords,
-          start,
-          start + durationForClip,
+          moment.start,
+          moment.end,
         );
         return generateViralTitle(transcript);
       });
@@ -678,15 +804,16 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
       clipTitles = titleResults.map((r) =>
         r.status === "fulfilled" && r.value ? r.value : "",
       );
-      autoTitlesGenerated = clipTitles.filter((t) => t.length > 0).length;
     }
 
-    // Phase 2: Render clips sequentially (CPU-bound FFmpeg encoding)
+    // Phase 3: Render clips sequentially (CPU-bound FFmpeg encoding)
     const clipResults: ClipResult[] = [];
     let karaokeCount = 0;
+    let hookCount = 0;
+    let thumbnailCount = 0;
 
     for (let i = 0; i < clipsData.length; i += 1) {
-      const { start, durationForClip } = clipsData[i];
+      const { moment, durationForClip } = clipsData[i];
       const txResult = transcriptionResults[i];
       const { hasSubtitles, subtitlePath, isKaraoke } =
         txResult.status === "fulfilled"
@@ -699,107 +826,69 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
 
       if (isKaraoke) karaokeCount++;
 
-      // Resolve per-clip title: auto-generated or manual fallback
-      const clipTitle = clipTitles[i] || fallbackTitle;
-      const safeTitle = ensureTextForDrawText(clipTitle);
-
+      // Title priority: auto-generated > LLM moment title > manual fallback
+      const clipTitle = clipTitles[i] || moment.title || fallbackTitle;
       const fileName = outputFileName(jobId, i);
       const finalPath = path.join(outputDir, fileName);
 
-      // Layout constants
-      // Black header bar at top with title, video pushed below it.
-      const HEADER_H = 200;  // px for the black title bar
-      const FOOTER_H = 180;  // px for the bottom watermark bar
-      const VIDEO_H = 1920 - HEADER_H; // remaining space for the video
+      // Render the base clip
+      await renderSingleClip({
+        sourceVideoPath: uploadFilePath,
+        outputPath: finalPath,
+        start: moment.start,
+        duration: durationForClip,
+        title: clipTitle,
+        watermark: input.watermark.trim() || "@viralclips",
+        subtitlePath: hasSubtitles ? subtitlePath : null,
+        splitScreen: applySplitScreen,
+        srcWidth,
+        srcHeight,
+      });
 
-      if (applySplitScreen) {
-        // -----------------------------------------------------------------
-        // Split-screen compositing for landscape video
-        // Each half scaled to 1080x(VIDEO_H/2), stacked vertically,
-        // then padded with black header bar for the title.
-        // -----------------------------------------------------------------
-        const halfH = Math.floor(VIDEO_H / 2);
-
-        const overlayFilters = [
-          // Bottom bar for watermark
-          `drawbox=x=0:y=h-${FOOTER_H}:w=iw:h=${FOOTER_H}:color=black@0.50:t=fill`,
-          // Divider line between the two halves
-          `drawbox=x=0:y=${HEADER_H + halfH - 2}:w=iw:h=4:color=white@0.3:t=fill`,
-          // Title: white text on the black header
-          `drawtext=text='${safeTitle}':font=Arial:fontcolor=white:fontsize=44:x=(w-text_w)/2:y=${Math.floor(HEADER_H / 2 - 22)}`,
-          // Watermark
-          `drawtext=text='${safeWatermark}':font=Arial:fontcolor=white@0.90:fontsize=34:x=(w-text_w)/2:y=h-th-55`,
-        ];
-        if (hasSubtitles) {
-          const safeSubPath = ensurePathForSubtitlesFilter(subtitlePath);
-          overlayFilters.push(`subtitles='${safeSubPath}'`);
+      // Hook optimizer: prepend the most impactful 2-3s as a "spoiler hook"
+      let hookApplied = false;
+      if (input.hookOptimizer && durationForClip > 15) {
+        try {
+          hookApplied = await applyHookOptimizer({
+            clipPath: finalPath,
+            sourceVideoPath: uploadFilePath,
+            clipStart: moment.start,
+            clipDuration: durationForClip,
+            visualSignals: visualAnalysis?.signals ?? [],
+            words: fullVideoWords,
+            jobId,
+            clipIndex: i,
+          });
+          if (hookApplied) hookCount++;
+        } catch {
+          diagnostics.push(`Hook optimizer fallo en clip ${i + 1}.`);
         }
+      }
 
-        const filterComplex = [
-          `[0:v]split[a][b]`,
-          `[a]crop=iw/2:ih:0:0,scale=1080:${halfH}[left]`,
-          `[b]crop=iw/2:ih:iw/2:0,scale=1080:${halfH}[right]`,
-          `[left][right]vstack,pad=1080:1920:0:${HEADER_H}:black,${overlayFilters.join(",")}[out]`,
-        ].join(";");
+      // Extract thumbnail: best frame from the clip
+      let thumbnailUrl: string | undefined;
+      try {
+        const thumbName = `${jobId}_thumb_${String(i + 1).padStart(2, "0")}.jpg`;
+        const thumbPath = path.join(outputDir, thumbName);
+        const bestTime = findBestThumbnailTime(
+          moment.start,
+          moment.start + durationForClip,
+          visualAnalysis?.signals ?? [],
+        );
+        const seekTime = bestTime - moment.start; // relative to clip start
 
         await runFfmpeg([
           "-y",
-          "-ss", start.toFixed(2),
-          "-t", durationForClip.toFixed(2),
-          "-i", uploadFilePath,
-          "-filter_complex", filterComplex,
-          "-map", "[out]",
-          "-map", "0:a?",
-          "-c:v", "libx264",
-          "-preset", clipVideoPreset,
-          "-crf", clipVideoCrf,
-          "-pix_fmt", "yuv420p",
-          "-c:a", "aac",
-          "-b:a", clipAudioBitrate,
-          "-movflags", "+faststart",
-          finalPath,
+          "-ss", Math.max(0, seekTime).toFixed(2),
+          "-i", finalPath,
+          "-frames:v", "1",
+          "-q:v", "3",
+          thumbPath,
         ]);
-      } else {
-        // -----------------------------------------------------------------
-        // Standard vertical crop
-        // Video scaled to 1080xVIDEO_H, padded with black header on top.
-        // -----------------------------------------------------------------
-        const filters: string[] = [
-          // Bottom bar for watermark
-          `drawbox=x=0:y=h-${FOOTER_H}:w=iw:h=${FOOTER_H}:color=black@0.50:t=fill`,
-        ];
-
-        if (hasSubtitles) {
-          const safeSubPath = ensurePathForSubtitlesFilter(subtitlePath);
-          filters.push(`subtitles='${safeSubPath}'`);
-        }
-
-        // Title: white text centered on the black header bar
-        filters.push(
-          `drawtext=text='${safeTitle}':font=Arial:fontcolor=white:fontsize=44:x=(w-text_w)/2:y=${Math.floor(HEADER_H / 2 - 22)}`,
-        );
-        // Watermark on bottom bar
-        filters.push(
-          `drawtext=text='${safeWatermark}':font=Arial:fontcolor=white@0.90:fontsize=34:x=(w-text_w)/2:y=h-th-55`,
-        );
-
-        // scale → crop to VIDEO_H → pad with HEADER_H black bar on top → overlays
-        await runFfmpeg([
-          "-y",
-          "-ss", start.toFixed(2),
-          "-t", durationForClip.toFixed(2),
-          "-i", uploadFilePath,
-          "-vf",
-          `scale=1080:${VIDEO_H}:force_original_aspect_ratio=increase,crop=1080:${VIDEO_H},pad=1080:1920:0:${HEADER_H}:black,${filters.join(",")}`,
-          "-c:v", "libx264",
-          "-preset", clipVideoPreset,
-          "-crf", clipVideoCrf,
-          "-pix_fmt", "yuv420p",
-          "-c:a", "aac",
-          "-b:a", clipAudioBitrate,
-          "-movflags", "+faststart",
-          finalPath,
-        ]);
+        thumbnailUrl = `/api/download/${encodeURIComponent(thumbName)}`;
+        thumbnailCount++;
+      } catch {
+        // Thumbnail extraction failed, not critical
       }
 
       if (hasSubtitles) {
@@ -809,57 +898,97 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
       clipResults.push({
         fileName,
         url: `/api/download/${encodeURIComponent(fileName)}`,
-        startSeconds: start,
+        startSeconds: moment.start,
         durationSeconds: durationForClip,
         hasSubtitles,
-        score: Number(
-          (scoreMap.get(Number(start.toFixed(2)))?.score ?? 0).toFixed(2),
-        ),
-        rationale: scoreMap.get(Number(start.toFixed(2)))?.rationale ?? "corte uniforme",
+        scores: moment.scores,
+        overallScore: moment.overallScore,
+        rationale: moment.rationale,
         title: clipTitle,
+        thumbnailUrl,
+        hookApplied,
       });
     }
 
     const subtitleCount = clipResults.filter((c) => c.hasSubtitles).length;
 
-    return {
-      jobId: sanitizeName(jobId),
+    // Preserve source video for the editor
+    const safeJobId = sanitizeName(jobId);
+    const sourcePreservePath = path.join(sourcesDir, `${safeJobId}${extension}`);
+    await fs.copyFile(uploadFilePath, sourcePreservePath).catch(() => {
+      diagnostics.push("No se pudo preservar el video fuente para el editor.");
+    });
+
+    const notes = [
+      canTranscribe()
+        ? subtitleCount > 0
+          ? `Subtitulos generados con OpenAI en ${subtitleCount}/${clipResults.length} clips.`
+          : "OpenAI disponible pero sin subtitulos generados en este lote."
+        : "Sin OPENAI_API_KEY: clips generados con titulo y marca de agua.",
+      karaokeCount > 0
+        ? `Subtitulos karaoke (word-by-word) en ${karaokeCount}/${subtitleCount} clips.`
+        : "Subtitulos karaoke no disponibles (sin timestamps de palabra).",
+      usedLlmDetection
+        ? visualAnalysis
+          ? `Deteccion multimodal (audio + vision): GPT-4o analizo transcripcion + ${visualAnalysis.signals.length} frames visuales para identificar ${moments.length} momentos.`
+          : `Deteccion de momentos con GPT-4o: ${moments.length} momentos virales identificados con duracion variable.`
+        : transcriptSegments.length > 0
+          ? "Deteccion heuristica: momentos seleccionados por densidad y engagement."
+          : "Sin transcripcion disponible: distribucion temporal uniforme.",
+      applySplitScreen
+        ? `Split-screen activado (${srcWidth}x${srcHeight}).`
+        : input.splitScreen
+          ? "Split-screen solicitado pero el video no es landscape."
+          : "Split-screen desactivado.",
+      `Caption preset: ${captionPreset.name}.`,
+      hookCount > 0
+        ? `Hook optimizer aplicado en ${hookCount}/${clipResults.length} clips.`
+        : input.hookOptimizer
+          ? "Hook optimizer activado pero no aplicado (clips muy cortos)."
+          : "Hook optimizer desactivado.",
+      thumbnailCount > 0
+        ? `Thumbnails generados: ${thumbnailCount}/${clipResults.length}.`
+        : "Sin thumbnails generados.",
+      `Render: preset=${clipVideoPreset} crf=${clipVideoCrf} audio=${clipAudioBitrate}.`,
+      sceneChanges.length > 0
+        ? `Cambios de escena detectados: ${sceneChanges.length}.`
+        : "Sin cambios de escena detectados.",
+      ...diagnostics,
+      "Formato de salida: vertical 1080x1920.",
+    ];
+
+    // Save job manifest for the post-generation editor
+    const manifest: JobManifest = {
+      jobId: safeJobId,
+      sourceVideoPath: sourcePreservePath,
+      sourceFileName: input.fileName,
       clips: clipResults,
-      notes: [
-        canTranscribe()
-          ? subtitleCount > 0
-            ? `Subtitulos generados con OpenAI en ${subtitleCount}/${clipResults.length} clips.`
-            : "OpenAI disponible pero sin subtitulos generados en este lote."
-          : "Sin OPENAI_API_KEY: clips generados con titulo y marca de agua.",
-        karaokeCount > 0
-          ? `Subtitulos karaoke (word-by-word) en ${karaokeCount}/${subtitleCount} clips.`
-          : "Subtitulos karaoke no disponibles (sin timestamps de palabra).",
-        input.smartMode && (transcriptSegmentsCount > 0 || sceneChanges.length > 0)
-          ? "Modo inteligente activo: score narrativo + deteccion de cambios de escena."
-          : "Modo inteligente no disponible: seleccion por distribucion temporal.",
-        usedLlmRerank
-          ? "Re-ranking final con LLM aplicado."
-          : "Re-ranking LLM no aplicado; seleccion heuristica.",
-        usedSentenceSnap
-          ? "Cortes ajustados a limites de frase (sentence-boundary snapping)."
-          : "Sin ajuste de limites de frase.",
-        input.autoTitle
-          ? autoTitlesGenerated > 0
-            ? `Titulos virales auto-generados en ${autoTitlesGenerated}/${clipResults.length} clips.`
-            : "Auto-titulo solicitado pero sin transcripcion disponible para generar."
-          : "Titulo manual aplicado a todos los clips.",
-        applySplitScreen
-          ? `Split-screen activado (${srcWidth}x${srcHeight} → dos vistas apiladas).`
-          : input.splitScreen
-            ? "Split-screen solicitado pero el video no es landscape; usando crop estandar."
-            : "Split-screen desactivado.",
-        `Render: preset=${clipVideoPreset} crf=${clipVideoCrf} audio=${clipAudioBitrate}.`,
-        sceneChanges.length > 0
-          ? `Cambios de escena detectados: ${sceneChanges.length}.`
-          : "Sin cambios de escena detectados.",
-        ...diagnostics,
-        "Formato de salida: vertical 1080x1920.",
-      ],
+      words: fullVideoWords,
+      visualAnalysis: visualAnalysis
+        ? {
+            summary: visualAnalysis.summary,
+            hotSpots: visualAnalysis.hotSpots,
+            signalCount: visualAnalysis.signals.length,
+          }
+        : undefined,
+      settings: {
+        watermark: input.watermark.trim() || "@viralclips",
+        subtitleSize: fontSize,
+        splitScreen: applySplitScreen,
+        captionPreset: captionPreset.id,
+        hookOptimizer: input.hookOptimizer,
+      },
+      notes,
+      createdAt: new Date().toISOString(),
+    };
+
+    const manifestPath = path.join(jobsDir, `${safeJobId}.json`);
+    await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf-8");
+
+    return {
+      jobId: safeJobId,
+      clips: clipResults,
+      notes,
     };
   } finally {
     await Promise.all([

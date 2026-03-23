@@ -22,12 +22,12 @@ const booleanPreprocess = z.preprocess((value) => {
 const formSchema = z.object({
   title: z.string().trim().max(80).default("Momento viral"),
   watermark: z.string().trim().max(50).default("@TuCanal"),
-  clips: z.coerce.number().int().min(1).max(12).default(6),
-  clipDuration: z.coerce.number().int().min(8).max(90).default(28),
-  subtitleSize: z.coerce.number().int().min(16).max(40).default(24),
-  smartMode: booleanPreprocess.default(true),
+  clips: z.coerce.number().int().min(1).max(20).default(8),
+  subtitleSize: z.coerce.number().int().min(24).max(56).default(44),
   splitScreen: booleanPreprocess.default(false),
-  autoTitle: booleanPreprocess.default(false),
+  autoTitle: booleanPreprocess.default(true),
+  captionPreset: z.string().trim().max(30).default("hormozi"),
+  hookOptimizer: booleanPreprocess.default(true),
 });
 
 type UploadResult = {
@@ -104,11 +104,11 @@ export async function POST(request: Request) {
       title: fields.title,
       watermark: fields.watermark,
       clips: fields.clips,
-      clipDuration: fields.clipDuration,
       subtitleSize: fields.subtitleSize,
-      smartMode: fields.smartMode,
       splitScreen: fields.splitScreen,
       autoTitle: fields.autoTitle,
+      captionPreset: fields.captionPreset,
+      hookOptimizer: fields.hookOptimizer,
     });
 
     const result = await processVideo({
@@ -117,11 +117,11 @@ export async function POST(request: Request) {
       title: payload.title,
       watermark: payload.watermark,
       clipCount: payload.clips,
-      clipDuration: payload.clipDuration,
       subtitleSize: payload.subtitleSize,
-      smartMode: payload.smartMode,
       splitScreen: payload.splitScreen,
       autoTitle: payload.autoTitle,
+      captionPreset: payload.captionPreset,
+      hookOptimizer: payload.hookOptimizer,
     });
 
     return NextResponse.json(result);
