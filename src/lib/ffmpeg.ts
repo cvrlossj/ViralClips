@@ -123,6 +123,54 @@ export async function extractCompressedAudio(
   ]);
 }
 
+/**
+ * Extracts keyframes (JPEG) from a video at regular intervals.
+ * Returns an array of { path, timestamp } sorted by time.
+ * Used for visual analysis with GPT-4o Vision.
+ */
+export async function extractKeyframes(params: {
+  inputPath: string;
+  outputDir: string;
+  jobId: string;
+  intervalSeconds?: number;
+  maxFrames?: number;
+  quality?: number;
+}): Promise<{ path: string; timestamp: number }[]> {
+  const {
+    inputPath,
+    outputDir,
+    jobId,
+    intervalSeconds = 5,
+    maxFrames = 60,
+    quality = 5, // JPEG quality (2=best, 31=worst)
+  } = params;
+
+  const outputPattern = `${outputDir}/${jobId}_frame_%04d.jpg`;
+
+  // Use fps filter to extract one frame every N seconds
+  // Scale to 512px wide (enough for Vision API, saves bandwidth)
+  await runBinary(ffmpegBin, [
+    "-y",
+    "-i", inputPath,
+    "-vf", `fps=1/${intervalSeconds},scale=512:-1`,
+    "-qscale:v", String(quality),
+    "-frames:v", String(maxFrames),
+    outputPattern,
+  ]);
+
+  // Read the generated frames and calculate timestamps
+  const { readdir } = await import("node:fs/promises");
+  const files = await readdir(outputDir);
+  const frameFiles = files
+    .filter((f) => f.startsWith(`${jobId}_frame_`) && f.endsWith(".jpg"))
+    .sort();
+
+  return frameFiles.map((f, i) => ({
+    path: `${outputDir}/${f}`,
+    timestamp: i * intervalSeconds,
+  }));
+}
+
 export async function runFfmpeg(args: string[]) {
   await runBinary(ffmpegBin, args);
 }

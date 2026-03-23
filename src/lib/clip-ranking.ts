@@ -1,42 +1,54 @@
 import OpenAI from "openai";
 import { runFfprobe } from "@/lib/ffmpeg";
 import type { TranscriptSegment } from "@/lib/transcription";
+import type { TranscriptWord } from "@/lib/transcription";
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type ClipScores = {
+  hook: number;       // 0-100: Do the first 3s stop the scroll?
+  flow: number;       // 0-100: Does the clip maintain engagement throughout?
+  engagement: number; // 0-100: Emotional intensity, humor, surprise
+  completeness: number; // 0-100: Does the clip tell a complete micro-story?
+};
+
+export type DetectedMoment = {
+  start: number;
+  end: number;
+  title: string;
+  scores: ClipScores;
+  overallScore: number;
+  rationale: string;
+  transcriptPreview: string;
+};
+
+// Legacy type — kept for heuristic fallback
 export type CandidateWindow = {
   start: number;
+  end: number;
   score: number;
   rationale: string;
   transcriptPreview: string;
   sceneHits: number;
 };
 
-const rerankClient = process.env.OPENAI_API_KEY
+export type AdSegment = {
+  start: number;
+  end: number;
+};
+
+// ---------------------------------------------------------------------------
+// OpenAI client
+// ---------------------------------------------------------------------------
+
+const llmClient = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
   : null;
 
-const hookWords = [
-  // Retention triggers
-  "mira", "escucha", "atento", "espera", "ojo", "cuidado",
-  // Superlatives / Intensity
-  "increible", "brutal", "epico", "tremendo", "bestia", "genial", "alucinante",
-  // Conflict / Surprise
-  "nunca", "nadie", "jamas", "imposible", "sorpresa", "giro", "impactante",
-  // Curiosity triggers
-  "secreto", "lo que paso", "la verdad", "no sabian", "resulta que", "imagina",
-  // Emotion / Humor
-  "locura", "gracioso", "error", "falla", "vergüenza", "ridículo",
-  // Viral markers
-  "viral", "momento", "esto es", "se volvio", "no puedo", "te juro",
-  // English hooks (mixed content)
-  "look", "wait", "never", "suddenly", "literally", "actually", "insane",
-  "crazy", "wild", "watch", "but then", "right here",
-];
-
 // ---------------------------------------------------------------------------
 // Ad / sponsor detection
-// ---------------------------------------------------------------------------
-// Scans transcript segments for common ad markers in Spanish and English.
-// Returns time ranges that should be avoided when selecting clip windows.
 // ---------------------------------------------------------------------------
 
 const adMarkers = [
@@ -55,11 +67,6 @@ const adMarkers = [
   "brought to you by", "thanks to", "shout out to",
 ];
 
-export type AdSegment = {
-  start: number;
-  end: number;
-};
-
 export function detectAdSegments(
   segments: TranscriptSegment[],
   bufferSeconds = 3,
@@ -71,11 +78,9 @@ export function detectAdSegments(
     const isAd = adMarkers.some((marker) => lower.includes(marker));
     if (!isAd) continue;
 
-    // Extend the ad range by bufferSeconds on each side to capture the full promo block
     const start = Math.max(0, seg.start - bufferSeconds);
     const end = seg.end + bufferSeconds;
 
-    // Merge with previous range if overlapping
     const last = adRanges[adRanges.length - 1];
     if (last && start <= last.end) {
       last.end = Math.max(last.end, end);
@@ -87,21 +92,9 @@ export function detectAdSegments(
   return adRanges;
 }
 
-export function isWindowInAdSegment(
-  windowStart: number,
-  clipDuration: number,
-  adSegments: AdSegment[],
-  overlapThreshold = 0.3,
-): boolean {
-  const windowEnd = windowStart + clipDuration;
-  for (const ad of adSegments) {
-    const overlapStart = Math.max(windowStart, ad.start);
-    const overlapEnd = Math.min(windowEnd, ad.end);
-    const overlap = Math.max(0, overlapEnd - overlapStart);
-    if (overlap / clipDuration >= overlapThreshold) return true;
-  }
-  return false;
-}
+// ---------------------------------------------------------------------------
+// Scene change detection
+// ---------------------------------------------------------------------------
 
 function normalizePathForMovieFilter(filePath: string) {
   return filePath
@@ -110,26 +103,11 @@ function normalizePathForMovieFilter(filePath: string) {
     .replace(/'/g, "\\'");
 }
 
-function wordCount(text: string) {
-  const cleaned = text.trim();
-  if (!cleaned) {
-    return 0;
-  }
-  return cleaned.split(/\s+/).length;
-}
-
-function hookCount(text: string) {
-  const lower = text.toLowerCase();
-  return hookWords.reduce((acc, item) => acc + (lower.includes(item) ? 1 : 0), 0);
-}
-
 export async function detectSceneChangeTimes(
   videoPath: string,
   durationSeconds?: number,
 ): Promise<number[]> {
   try {
-    // For long videos (>10 min), raise threshold to reduce noise and speed up analysis.
-    // Also use a lower framerate analysis to avoid decoding every frame.
     const isLong = (durationSeconds ?? 0) > 600;
     const threshold = isLong ? 0.42 : 0.34;
 
@@ -150,230 +128,111 @@ export async function detectSceneChangeTimes(
       "csv=p=0",
     ];
 
-    // For very long videos, add a read duration limit to avoid 15+ min analysis
     if ((durationSeconds ?? 0) > 1800) {
-      // Analyze only the first 30 minutes for videos > 30 min
       args.splice(4, 0, "-t", "1800");
     }
 
     const output = await runFfprobe(args);
 
-    const values = output
+    return output
       .split(/\r?\n/)
       .map((line) => Number(line.split(",")[0].trim()))
       .filter((value) => Number.isFinite(value) && value >= 0);
-
-    return values;
   } catch {
     return [];
   }
 }
 
-function scoreWindow(params: {
-  start: number;
-  clipDuration: number;
+// ---------------------------------------------------------------------------
+// LLM-first moment detection (the core improvement)
+// ---------------------------------------------------------------------------
+// Instead of sliding a fixed-size window, we send the full timestamped
+// transcript to GPT-4o and ask it to identify the best viral moments
+// with their natural start/end times. The LLM understands context,
+// humor, story arcs, and knows where moments naturally begin and end.
+// ---------------------------------------------------------------------------
+
+function buildTimestampedTranscript(segments: TranscriptSegment[]): string {
+  return segments
+    .map((s) => `[${formatTimecode(s.start)} - ${formatTimecode(s.end)}] ${s.text}`)
+    .join("\n");
+}
+
+function formatTimecode(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+export async function detectMomentsWithLlm(params: {
   segments: TranscriptSegment[];
   sceneChanges: number[];
-}) {
-  const { start, clipDuration, segments, sceneChanges } = params;
-  const end = start + clipDuration;
-  const inside = segments.filter((segment) => segment.end > start && segment.start < end);
-  const text = inside.map((segment) => segment.text).join(" ").trim();
+  adSegments: AdSegment[];
+  videoDuration: number;
+  maxClips: number;
+  visualContext?: string;
+}): Promise<DetectedMoment[] | null> {
+  if (!llmClient) return null;
 
-  const words = wordCount(text);
-  const speechSeconds = inside.reduce((acc, segment) => {
-    const segStart = Math.max(start, segment.start);
-    const segEnd = Math.min(end, segment.end);
-    return acc + Math.max(0, segEnd - segStart);
-  }, 0);
+  const { segments, sceneChanges, adSegments, videoDuration, maxClips, visualContext } = params;
+  if (segments.length === 0) return null;
 
-  const speechCoverage = speechSeconds / Math.max(clipDuration, 1);
-  const density = words / Math.max(clipDuration, 1);
-  const punctuation =
-    ((text.match(/[!?]/g) ?? []).length + (text.match(/\.{3}/g) ?? []).length) *
-    0.6;
-  const hooks = hookCount(text);
-  const hooksBoost = hooks * 2.2;
-  const avgNoSpeechProb =
-    inside.length > 0
-      ? inside.reduce((acc, segment) => acc + (segment.noSpeechProb ?? 0.3), 0) /
-        inside.length
-      : 0.6;
+  const transcript = buildTimestampedTranscript(segments);
 
-  const sceneHits = sceneChanges.filter((time) => time >= start && time <= end).length;
-  const sceneBoost = Math.min(sceneHits, 3) * 1.2;
+  // Build ad ranges string for the prompt
+  const adRangesStr = adSegments.length > 0
+    ? `\n\nZONAS DE PUBLICIDAD (EVITAR): ${adSegments.map((a) => `${formatTimecode(a.start)}-${formatTimecode(a.end)}`).join(", ")}`
+    : "";
 
-  const firstSegment = inside[0];
-  const lastSegment = inside[inside.length - 1];
-  const startsMidSentence =
-    Boolean(firstSegment) &&
-    firstSegment.start < start + 0.35 &&
-    firstSegment.text.length > 0 &&
-    !/^[A-Z0-9"'¿¡]/.test(firstSegment.text.trim());
-  const endsMidSentence =
-    Boolean(lastSegment) &&
-    lastSegment.end > end - 0.35 &&
-    lastSegment.text.length > 0 &&
-    !/[.!?…]$/.test(lastSegment.text.trim());
+  // Build scene changes hint
+  const sceneStr = sceneChanges.length > 0
+    ? `\n\nCAMBIOS DE ESCENA DETECTADOS EN: ${sceneChanges.slice(0, 50).map((t) => formatTimecode(t)).join(", ")}`
+    : "";
 
-  const openingText = inside
-    .filter((segment) => segment.start <= start + 2.7)
-    .map((segment) => segment.text)
-    .join(" ");
-  const openingHookBoost =
-    hookCount(openingText) * 0.95 + ((openingText.match(/[!?]/g) ?? []).length > 0 ? 0.8 : 0);
+  // Visual analysis context (from GPT-4o Vision keyframe analysis)
+  const visualStr = visualContext
+    ? `\n\n${visualContext}`
+    : "";
 
-  const boundaryPenalty =
-    (startsMidSentence ? 1.9 : 0) + (endsMidSentence ? 1.9 : 0);
+  const prompt = `Eres un editor experto en contenido viral para YouTube Shorts, TikTok e Instagram Reels.
 
-  const score =
-    density * 5.4 +
-    speechCoverage * 6.2 +
-    punctuation +
-    hooksBoost +
-    sceneBoost -
-    avgNoSpeechProb * 3.0 +
-    openingHookBoost -
-    boundaryPenalty;
+TRANSCRIPCION COMPLETA CON TIMESTAMPS:
+${transcript}
 
-  const preview = text.length > 220 ? `${text.slice(0, 220)}...` : text;
+DURACION TOTAL DEL VIDEO: ${formatTimecode(videoDuration)}${adRangesStr}${sceneStr}${visualStr}
 
-  return {
-    score,
-    sceneHits,
-    transcriptPreview: preview,
-    rationale: `densidad ${density.toFixed(2)} · cobertura ${speechCoverage.toFixed(2)} · hooks ${hooks} · escenas ${sceneHits} · cortes ${boundaryPenalty > 0 ? "abruptos" : "limpios"}`,
-  };
-}
+TU TAREA: Identifica hasta ${maxClips} momentos VIRALES del video. Cada momento debe ser un clip auto-contenido con DURACION VARIABLE (minimo 15 segundos, maximo 180 segundos).
 
-export function buildCandidateWindows(params: {
-  duration: number;
-  clipDuration: number;
-  segments: TranscriptSegment[];
-  sceneChanges: number[];
-}) {
-  const { duration, clipDuration, segments, sceneChanges } = params;
-  const maxStart = Math.max(0, duration - clipDuration);
-  const stride = Math.max(2, Math.floor(clipDuration * 0.3));
-  const starts = new Set<number>();
+REGLAS CRITICAS:
+1. Cada clip debe tener un INICIO NATURAL (inicio de frase, momento de atencion) y un FINAL NATURAL (fin de una idea, remate, reaccion).
+2. NO cortes a mitad de una oracion o momento. El clip debe sentirse COMPLETO.
+3. La duracion la determina el CONTENIDO, no un numero fijo. Un chiste rapido puede ser 18s, una historia completa 90s.
+4. Los clips NO deben solaparse. Deja al menos 5 segundos entre clips.
+5. EVITA las zonas de publicidad marcadas.
+6. Prioriza: momentos graciosos, giros inesperados, revelaciones, reacciones extremas, conflictos, tension maxima.
+7. COMBINA el analisis de audio (transcripcion) con el analisis VISUAL. Los mejores clips tienen AMBOS: dialogo interesante + accion visual intensa.
+8. Si hay zonas visualmente intensas, PRIORIZA clips que las incluyan. Un momento con reacciones faciales extremas + dialogo gracioso = clip viral garantizado.
 
-  for (let start = 0; start <= maxStart + 0.01; start += stride) {
-    starts.add(Number(start.toFixed(2)));
-  }
+SCORING (0-100 cada uno):
+- hook: Los primeros 3 segundos del clip detienen el scroll? Hay una frase gancho, sorpresa, o tension inmediata? BONUS si hay accion visual inmediata.
+- flow: El ritmo se mantiene durante todo el clip? Hay dinamismo, sin silencios muertos? Considerar variedad visual.
+- engagement: Hay emocion fuerte? Humor, drama, sorpresa, tension? El espectador siente algo? Considerar reacciones faciales visibles.
+- completeness: El clip cuenta una micro-historia completa? Tiene inicio, desarrollo y cierre/remate?
 
-  sceneChanges.forEach((sceneTime) => {
-    const candidates = [
-      sceneTime - clipDuration * 0.45,
-      sceneTime - clipDuration * 0.15,
-      sceneTime,
-    ];
+RESPONDE UNICAMENTE CON JSON VALIDO, SIN MARKDOWN NI TEXTO ADICIONAL:
+{"moments":[{"start":12.5,"end":38.2,"title":"Titulo viral corto 6-8 palabras","hook":85,"flow":78,"engagement":92,"completeness":80,"rationale":"Por que este momento es viral"}]}
 
-    candidates.forEach((value) => {
-      const normalized = Math.min(maxStart, Math.max(0, value));
-      starts.add(Number(normalized.toFixed(2)));
-    });
-  });
-
-  const windows: CandidateWindow[] = Array.from(starts).map((start) => {
-    const scored = scoreWindow({
-      start,
-      clipDuration,
-      segments,
-      sceneChanges,
-    });
-
-    return {
-      start,
-      score: scored.score,
-      rationale: scored.rationale,
-      transcriptPreview: scored.transcriptPreview,
-      sceneHits: scored.sceneHits,
-    };
-  });
-
-  windows.sort((a, b) => b.score - a.score);
-  return windows;
-}
-
-export function pickHeuristicWindows(params: {
-  candidates: CandidateWindow[];
-  clipCount: number;
-  clipDuration: number;
-}) {
-  const { candidates, clipCount, clipDuration } = params;
-  const selected: CandidateWindow[] = [];
-  const minGap = clipDuration * 0.42;
-
-  for (const candidate of candidates) {
-    if (selected.length >= clipCount) {
-      break;
-    }
-
-    const collides = selected.some(
-      (item) => Math.abs(item.start - candidate.start) < minGap,
-    );
-
-    if (!collides) {
-      selected.push(candidate);
-    }
-  }
-
-  selected.sort((a, b) => a.start - b.start);
-  return selected;
-}
-
-export async function rerankWithLlm(params: {
-  candidates: CandidateWindow[];
-  clipCount: number;
-  clipDuration: number;
-}) {
-  if (!rerankClient) {
-    return null;
-  }
-
-  const { candidates, clipCount, clipDuration } = params;
-  if (candidates.length === 0) {
-    return null;
-  }
-
-  const shortlist = candidates.slice(0, 20).map((candidate, index) => ({
-    id: index + 1,
-    start: Number(candidate.start.toFixed(2)),
-    heuristicScore: Number(candidate.score.toFixed(2)),
-    rationale: candidate.rationale,
-    preview: candidate.transcriptPreview,
-  }));
-
-  const prompt = [
-    "Eres un editor experto en contenido viral para YouTube Shorts, TikTok e Instagram Reels.",
-    `Selecciona exactamente ${clipCount} clips de ${clipDuration}s con MAXIMO potencial de retencion.`,
-    "",
-    "CRITERIOS DE SELECCION (en orden de importancia):",
-    "1. HOOK INICIAL (40%): Los primeros 3 segundos detienen el scroll? Busca sorpresa, humor, tension, drama o una revelacion.",
-    "2. ARCO DE RETENCION (30%): El clip genera curiosidad que recompensa al espectador que se queda hasta el final?",
-    "3. ENERGIA Y DENSIDAD (20%): Alta densidad de palabras, emocion clara, ritmo dinamico.",
-    "4. CORTES LIMPIOS (10%): Comienza en el inicio de una frase, termina en una pausa natural.",
-    "",
-    `REGLA OBLIGATORIA: Cada clip DEBE estar separado por al menos ${clipDuration}s del siguiente. NO repitas el mismo momento.`,
-    "",
-    "PENALIZA FUERTEMENTE: inicios a mitad de oracion, silencios prolongados, contenido repetitivo o sin carga emocional.",
-    "PRIORIZA: momentos graciosos, giros inesperados, revelaciones, reacciones extremas, momentos de maxima tension.",
-    "",
-    `Devuelve UNICAMENTE JSON valido con exactamente ${clipCount} elementos, sin texto adicional:`,
-    '{"selected":[{"start":12.3,"score":95,"rationale":"hook en primeros 2s + tension narrativa sostenida"}]}',
-    "",
-    `Candidatos: ${JSON.stringify(shortlist)}`,
-  ].join("\n");
+Los timestamps deben ser en SEGUNDOS (decimal). El titulo NO debe tener emojis ni hashtags.`;
 
   try {
-    const response = await rerankClient.chat.completions.create({
+    const response = await llmClient.chat.completions.create({
       model: "gpt-4o",
-      temperature: 0.15,
+      temperature: 0.3,
+      max_tokens: 4096,
       messages: [
         {
           role: "system",
-          content:
-            "Eres un editor experto en videos virales. Respondes SOLO con JSON valido, sin markdown ni texto adicional.",
+          content: "Eres un editor experto en videos virales. Analizas transcripciones para encontrar los momentos mas virales. Respondes SOLO con JSON valido.",
         },
         { role: "user", content: prompt },
       ],
@@ -382,60 +241,206 @@ export async function rerankWithLlm(params: {
     const content = response.choices[0]?.message?.content ?? "";
     const startJson = content.indexOf("{");
     const endJson = content.lastIndexOf("}");
-    if (startJson < 0 || endJson <= startJson) {
-      return null;
-    }
+    if (startJson < 0 || endJson <= startJson) return null;
 
     const parsed = JSON.parse(content.slice(startJson, endJson + 1)) as {
-      selected?: Array<{ start?: number; score?: number; rationale?: string }>;
+      moments?: Array<{
+        start?: number;
+        end?: number;
+        title?: string;
+        hook?: number;
+        flow?: number;
+        engagement?: number;
+        completeness?: number;
+        rationale?: string;
+      }>;
     };
 
-    const selected = (parsed.selected ?? [])
-      .map((item) => ({
-        start: Number(item.start),
-        score: Number(item.score ?? 0),
-        rationale: String(item.rationale ?? "re-ranking llm"),
-      }))
-      .filter((item) => Number.isFinite(item.start));
+    const moments = (parsed.moments ?? [])
+      .map((m) => {
+        const start = Number(m.start);
+        const end = Number(m.end);
+        const duration = end - start;
 
-    if (selected.length === 0) {
-      return null;
-    }
+        // Validate: must be 15-180s, finite, within video bounds
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+        if (duration < 10 || duration > 180) return null;
+        if (start < 0 || end > videoDuration + 2) return null;
 
-    // Map LLM picks back to actual candidates, enforcing minimum gap
-    const minGap = clipDuration * 0.8;
-    const mapped: CandidateWindow[] = [];
-    const usedStarts = new Set<number>();
+        const scores: ClipScores = {
+          hook: clamp(Number(m.hook ?? 50), 0, 100),
+          flow: clamp(Number(m.flow ?? 50), 0, 100),
+          engagement: clamp(Number(m.engagement ?? 50), 0, 100),
+          completeness: clamp(Number(m.completeness ?? 50), 0, 100),
+        };
 
-    for (const item of selected.slice(0, clipCount * 2)) {
-      if (mapped.length >= clipCount) break;
+        // Weighted overall score (matching OpusClip's priorities)
+        const overallScore = Math.round(
+          scores.hook * 0.35 +
+          scores.flow * 0.20 +
+          scores.engagement * 0.30 +
+          scores.completeness * 0.15,
+        );
 
-      const nearest = candidates.reduce((best, candidate) => {
-        if (!best) return candidate;
-        const d1 = Math.abs(candidate.start - item.start);
-        const d2 = Math.abs(best.start - item.start);
-        return d1 < d2 ? candidate : best;
-      }, null as CandidateWindow | null);
+        // Get transcript preview for this range
+        const preview = segments
+          .filter((s) => s.end > start && s.start < end)
+          .map((s) => s.text)
+          .join(" ")
+          .trim();
 
-      if (!nearest) continue;
+        return {
+          start: Number(start.toFixed(2)),
+          end: Number(end.toFixed(2)),
+          title: String(m.title ?? "").trim().slice(0, 80) || "Clip viral",
+          scores,
+          overallScore,
+          rationale: String(m.rationale ?? "").trim(),
+          transcriptPreview: preview.length > 300 ? `${preview.slice(0, 300)}...` : preview,
+        } satisfies DetectedMoment;
+      })
+      .filter((m): m is DetectedMoment => m !== null);
 
-      // Skip if this candidate was already used or too close to a previous pick
-      if (usedStarts.has(nearest.start)) continue;
-      const tooClose = mapped.some(
-        (prev) => Math.abs(prev.start - nearest.start) < minGap,
-      );
-      if (tooClose) continue;
+    if (moments.length === 0) return null;
 
-      usedStarts.add(nearest.start);
-      mapped.push({
-        ...nearest,
-        score: Number(item.score.toFixed(2)),
-        rationale: item.rationale,
-      });
-    }
+    // Remove overlapping moments (keep higher score)
+    const deduped = deduplicateMoments(moments);
 
-    return mapped.length > 0 ? mapped : null;
+    // Sort by score descending, then take top maxClips
+    deduped.sort((a, b) => b.overallScore - a.overallScore);
+    return deduped.slice(0, maxClips);
   } catch {
     return null;
   }
+}
+
+function clamp(v: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, v));
+}
+
+function deduplicateMoments(moments: DetectedMoment[]): DetectedMoment[] {
+  // Sort by score descending
+  const sorted = [...moments].sort((a, b) => b.overallScore - a.overallScore);
+  const result: DetectedMoment[] = [];
+
+  for (const m of sorted) {
+    const overlaps = result.some((existing) => {
+      const overlapStart = Math.max(m.start, existing.start);
+      const overlapEnd = Math.min(m.end, existing.end);
+      const overlap = Math.max(0, overlapEnd - overlapStart);
+      const duration = m.end - m.start;
+      return overlap > duration * 0.3; // >30% overlap = duplicate
+    });
+    if (!overlaps) result.push(m);
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Heuristic fallback — used when LLM is unavailable
+// ---------------------------------------------------------------------------
+// This is the old sliding-window approach, kept as fallback.
+// Now produces variable-length windows by using segment boundaries.
+// ---------------------------------------------------------------------------
+
+const hookWords = [
+  "mira", "escucha", "atento", "espera", "ojo", "cuidado",
+  "increible", "brutal", "epico", "tremendo", "bestia", "genial", "alucinante",
+  "nunca", "nadie", "jamas", "imposible", "sorpresa", "giro", "impactante",
+  "secreto", "lo que paso", "la verdad", "no sabian", "resulta que", "imagina",
+  "locura", "gracioso", "error", "falla",
+  "viral", "momento", "esto es", "se volvio", "no puedo", "te juro",
+  "look", "wait", "never", "suddenly", "literally", "actually", "insane",
+  "crazy", "wild", "watch", "but then", "right here",
+];
+
+function hookCount(text: string) {
+  const lower = text.toLowerCase();
+  return hookWords.reduce((acc, item) => acc + (lower.includes(item) ? 1 : 0), 0);
+}
+
+export function buildHeuristicMoments(params: {
+  segments: TranscriptSegment[];
+  sceneChanges: number[];
+  adSegments: AdSegment[];
+  videoDuration: number;
+  maxClips: number;
+}): DetectedMoment[] {
+  const { segments, sceneChanges, adSegments, videoDuration, maxClips } = params;
+  if (segments.length === 0) return [];
+
+  // Build candidate windows of varying sizes: 20s, 30s, 45s, 60s
+  const windowSizes = [20, 30, 45, 60];
+  const candidates: DetectedMoment[] = [];
+
+  for (const size of windowSizes) {
+    const stride = Math.max(3, Math.floor(size * 0.25));
+    const maxStart = Math.max(0, videoDuration - size);
+
+    for (let start = 0; start <= maxStart; start += stride) {
+      const end = start + size;
+
+      // Skip if overlaps with ads
+      const inAd = adSegments.some((ad) => {
+        const os = Math.max(start, ad.start);
+        const oe = Math.min(end, ad.end);
+        return Math.max(0, oe - os) / size > 0.3;
+      });
+      if (inAd) continue;
+
+      const inside = segments.filter((s) => s.end > start && s.start < end);
+      const text = inside.map((s) => s.text).join(" ").trim();
+      if (!text) continue;
+
+      const words = text.split(/\s+/).length;
+      const speechSeconds = inside.reduce((acc, s) => {
+        return acc + Math.max(0, Math.min(end, s.end) - Math.max(start, s.start));
+      }, 0);
+
+      const speechCoverage = speechSeconds / size;
+      const density = words / size;
+      const hooks = hookCount(text);
+      const scenes = sceneChanges.filter((t) => t >= start && t <= end).length;
+
+      // Sentence boundary check
+      const first = inside[0];
+      const last = inside[inside.length - 1];
+      const startClean = !first || first.start >= start - 0.5 || /^[A-Z0-9"'¿¡]/.test(first.text.trim());
+      const endClean = !last || last.end <= end + 0.5 || /[.!?…]$/.test(last.text.trim());
+
+      const hookScore = clamp(Math.round(hooks * 15 + (startClean ? 20 : 0)), 0, 100);
+      const flowScore = clamp(Math.round(speechCoverage * 80 + density * 5), 0, 100);
+      const engagementScore = clamp(Math.round(hooks * 12 + scenes * 8 + density * 8), 0, 100);
+      const completenessScore = clamp(Math.round(
+        (startClean ? 35 : 0) + (endClean ? 35 : 0) + speechCoverage * 30,
+      ), 0, 100);
+
+      const overall = Math.round(
+        hookScore * 0.35 + flowScore * 0.20 + engagementScore * 0.30 + completenessScore * 0.15,
+      );
+
+      const preview = text.length > 300 ? `${text.slice(0, 300)}...` : text;
+
+      candidates.push({
+        start: Number(start.toFixed(2)),
+        end: Number(end.toFixed(2)),
+        title: "Clip viral",
+        scores: {
+          hook: hookScore,
+          flow: flowScore,
+          engagement: engagementScore,
+          completeness: completenessScore,
+        },
+        overallScore: overall,
+        rationale: `densidad ${density.toFixed(1)} · cobertura ${(speechCoverage * 100).toFixed(0)}% · hooks ${hooks} · escenas ${scenes}`,
+        transcriptPreview: preview,
+      });
+    }
+  }
+
+  // Sort by score, deduplicate overlaps, return top N
+  candidates.sort((a, b) => b.overallScore - a.overallScore);
+  const deduped = deduplicateMoments(candidates);
+  return deduped.slice(0, maxClips);
 }
