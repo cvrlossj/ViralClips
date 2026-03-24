@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { jobsDir, outputDir, tempDir } from "@/lib/paths";
+import { jobsDir, outputDir, storageRoot, tempDir } from "@/lib/paths";
 import { renderSingleClip, type JobManifest } from "@/lib/video-pipeline";
 import { getMediaDimensions } from "@/lib/ffmpeg";
 import { canTranscribe } from "@/lib/transcription";
@@ -76,6 +76,17 @@ export async function POST(request: Request) {
       }
     }
 
+    // Resolve watermark image path
+    let watermarkPath: string | null = null;
+    const wmImage = (manifest.settings as Record<string, unknown>).watermarkImage as string | undefined;
+    if (wmImage && wmImage !== "none") {
+      const wmFullPath = path.join(storageRoot, "watermark", path.basename(wmImage));
+      try {
+        await fs.access(wmFullPath);
+        watermarkPath = wmFullPath;
+      } catch { /* watermark file missing, skip */ }
+    }
+
     // Re-render the clip
     const outputPath = path.join(outputDir, clip.fileName);
     await renderSingleClip({
@@ -90,6 +101,7 @@ export async function POST(request: Request) {
       srcWidth,
       srcHeight,
       hookText: clip.hookText || undefined,
+      watermarkPath,
     });
 
     // Clean up temp subtitle file

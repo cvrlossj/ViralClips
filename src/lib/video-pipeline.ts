@@ -64,6 +64,8 @@ type PipelineInput = {
   captionPreset: string;
   /** Enable hook optimizer (spoiler hook at start) */
   hookOptimizer: boolean;
+  /** Watermark image filename from storage/watermark/ (e.g. "marca_de_agua.png") or "none" */
+  watermarkImage: string;
 };
 
 export type ClipResult = {
@@ -107,6 +109,7 @@ export type JobManifest = {
     splitScreen: boolean;
     captionPreset: string;
     hookOptimizer: boolean;
+    watermarkImage: string;
   };
   notes: string[];
   createdAt: string;
@@ -356,16 +359,19 @@ async function transcribeClipAudio(params: {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Anti-copyright: watermark PNG path
+// Anti-copyright: watermark PNG
 // ---------------------------------------------------------------------------
-const WATERMARK_PATH = path.join(storageRoot, "watermark", "marca_de_agua.png");
+const WATERMARK_DIR = path.join(storageRoot, "watermark");
 
-async function watermarkExists(): Promise<boolean> {
+async function resolveWatermarkPath(fileName?: string): Promise<string | null> {
+  if (!fileName || fileName === "none") return null;
+  const safeName = path.basename(fileName);
+  const fullPath = path.join(WATERMARK_DIR, safeName);
   try {
-    await fs.access(WATERMARK_PATH);
-    return true;
+    await fs.access(fullPath);
+    return fullPath;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -384,6 +390,8 @@ export async function renderSingleClip(params: {
   hookText?: string;
   /** Zoom timestamp relative to clip start (seconds) */
   zoomAt?: number;
+  /** Absolute path to watermark PNG (or null to skip) */
+  watermarkPath?: string | null;
 }): Promise<void> {
   const { sourceVideoPath, outputPath, start, duration, subtitlePath, splitScreen } = params;
 
@@ -402,8 +410,9 @@ export async function renderSingleClip(params: {
   const isLandscape = params.srcWidth > params.srcHeight && params.srcWidth > 0;
   const applySplit = splitScreen && isLandscape;
 
-  // Check if watermark image exists
-  const hasWatermark = await watermarkExists();
+  // Watermark image overlay
+  const watermarkPath = params.watermarkPath ?? null;
+  const hasWatermark = !!watermarkPath;
 
   // Hook text overlay: big text shown in first 3 seconds
   const hookTextFilter = params.hookText
@@ -454,7 +463,7 @@ export async function renderSingleClip(params: {
 
     let filterComplex: string;
     if (hasWatermark) {
-      inputs.push("-i", WATERMARK_PATH);
+      inputs.push("-i", watermarkPath!);
       filterComplex = [
         `[0:v]split[a][b]`,
         `[a]crop=iw/2:ih:0:0,scale=${OUT_W}:${halfH}[left]`,
@@ -498,7 +507,7 @@ export async function renderSingleClip(params: {
 
     if (hasWatermark) {
       // Use filter_complex for watermark overlay
-      inputs.push("-i", WATERMARK_PATH);
+      inputs.push("-i", watermarkPath!);
 
       const videoChain = `[0:v]${scaleChain}${filters.length > 0 ? `,${filters.join(",")}` : ""}[base]`;
       const wmChain = `[1:v]scale=160:-1,format=rgba,colorchannelmixer=aa=0.7[wm]`;
@@ -940,6 +949,9 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
     }
 
     // Phase 3: Render clips sequentially (CPU-bound FFmpeg encoding)
+    // Resolve watermark image path once (used for all clips)
+    const resolvedWatermarkPath = await resolveWatermarkPath(input.watermarkImage);
+
     const clipResults: ClipResult[] = [];
     let karaokeCount = 0;
     let hookCount = 0;
@@ -971,7 +983,7 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         ? moment.zoomTimestamp - moment.start
         : undefined;
 
-      // Render the base clip with hook text overlay and zoom
+      // Render the base clip with hook text overlay, zoom, and anti-copyright
       await renderSingleClip({
         sourceVideoPath: uploadFilePath,
         outputPath: finalPath,
@@ -985,6 +997,7 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         srcHeight,
         hookText: moment.hookText || undefined,
         zoomAt,
+        watermarkPath: resolvedWatermarkPath,
       });
 
       // Hook optimizer: prepend the most impactful 2-3s as a "spoiler hook"
@@ -1125,6 +1138,7 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         splitScreen: applySplitScreen,
         captionPreset: captionPreset.id,
         hookOptimizer: input.hookOptimizer,
+        watermarkImage: input.watermarkImage || "none",
       },
       notes,
       createdAt: new Date().toISOString(),

@@ -9,6 +9,7 @@ import {
   Copy,
   Cpu,
   Download,
+  ImageIcon,
   Loader2,
   Pencil,
   Search,
@@ -115,6 +116,10 @@ export default function Home() {
   const [autoTitle, setAutoTitle] = useState(true);
   const [captionPreset, setCaptionPreset] = useState("hormozi");
   const [hookOptimizer, setHookOptimizer] = useState(true);
+  const [watermarkImage, setWatermarkImage] = useState("none");
+  const [availableWatermarks, setAvailableWatermarks] = useState<
+    Array<{ fileName: string; name: string; previewUrl: string }>
+  >([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [response, setResponse] = useState<ProcessResponse | null>(null);
@@ -173,6 +178,17 @@ export default function Home() {
     fetch("/api/jobs", { cache: "no-store" })
       .then((r) => r.json())
       .then((data) => { if (mounted) setPreviousJobs(data); })
+      .catch(() => {});
+
+    // Load available watermark images
+    fetch("/api/watermarks", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((data) => {
+        if (mounted && Array.isArray(data) && data.length > 0) {
+          setAvailableWatermarks(data);
+          setWatermarkImage(data[0].fileName); // auto-select first
+        }
+      })
       .catch(() => {});
 
     // Load active TikTok benchmark
@@ -250,6 +266,7 @@ export default function Home() {
     form.append("autoTitle", String(autoTitle));
     form.append("captionPreset", captionPreset);
     form.append("hookOptimizer", String(hookOptimizer));
+    form.append("watermarkImage", watermarkImage);
 
     setLoading(true);
     setError(null);
@@ -486,18 +503,65 @@ export default function Home() {
 
                     <Separator />
 
-                    <div className="space-y-2">
-                      <Label htmlFor="watermark">Marca de agua</Label>
-                      <Input
-                        id="watermark"
-                        value={watermark}
-                        onChange={(e) => setWatermark(e.target.value)}
-                        placeholder="@TuCanal"
-                        maxLength={50}
-                      />
-                      <p className="text-xs text-(--muted-fg)">
-                        Aparece en la barra inferior del video.
-                      </p>
+                    {/* Dynamic watermark selector */}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between">
+                        <Label className="flex items-center gap-1.5">
+                          <ImageIcon className="h-3.5 w-3.5" />
+                          Marca de agua
+                        </Label>
+                        {watermarkImage !== "none" && (
+                          <button
+                            type="button"
+                            onClick={() => setWatermarkImage("none")}
+                            className="text-[10px] text-(--muted-fg) hover:text-(--foreground) transition-colors"
+                          >
+                            Sin marca de agua
+                          </button>
+                        )}
+                      </div>
+
+                      {availableWatermarks.length > 0 ? (
+                        <div className="grid grid-cols-3 gap-2">
+                          {availableWatermarks.map((wm) => (
+                            <button
+                              key={wm.fileName}
+                              type="button"
+                              onClick={() => setWatermarkImage(wm.fileName)}
+                              className={`group relative rounded-lg border overflow-hidden transition-all ${
+                                watermarkImage === wm.fileName
+                                  ? "border-(--accent) ring-2 ring-(--accent)/30"
+                                  : "border-(--line) hover:border-(--line-2)"
+                              }`}
+                            >
+                              <div className="aspect-square bg-(--surface-2) flex items-center justify-center p-2">
+                                <img
+                                  src={wm.previewUrl}
+                                  alt={wm.name}
+                                  className="max-h-full max-w-full object-contain"
+                                />
+                              </div>
+                              <p className="text-[10px] text-center py-1 px-1 truncate text-(--muted-fg)">
+                                {wm.name}
+                              </p>
+                              {watermarkImage === wm.fileName && (
+                                <div className="absolute top-1 right-1">
+                                  <CheckCircle2 className="h-4 w-4 text-(--accent)" />
+                                </div>
+                              )}
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="rounded-lg border border-dashed border-(--line) bg-(--surface-2) px-4 py-3 text-center">
+                          <p className="text-xs text-(--muted-fg)">
+                            Sin marcas de agua disponibles.
+                          </p>
+                          <p className="text-[10px] text-(--muted-fg) mt-1">
+                            Agrega imagenes PNG en storage/watermark/
+                          </p>
+                        </div>
+                      )}
                     </div>
 
                     <Separator />

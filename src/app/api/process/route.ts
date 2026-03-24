@@ -28,6 +28,7 @@ const formSchema = z.object({
   autoTitle: booleanPreprocess.default(true),
   captionPreset: z.string().trim().max(30).default("hormozi"),
   hookOptimizer: booleanPreprocess.default(true),
+  watermarkImage: z.string().trim().max(100).default("none"),
 });
 
 type UploadResult = {
@@ -109,6 +110,7 @@ export async function POST(request: Request) {
       autoTitle: fields.autoTitle,
       captionPreset: fields.captionPreset,
       hookOptimizer: fields.hookOptimizer,
+      watermarkImage: fields.watermarkImage,
     });
 
     const result = await processVideo({
@@ -122,6 +124,7 @@ export async function POST(request: Request) {
       autoTitle: payload.autoTitle,
       captionPreset: payload.captionPreset,
       hookOptimizer: payload.hookOptimizer,
+      watermarkImage: payload.watermarkImage,
     });
 
     return NextResponse.json(result);
