@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   ChevronLeft,
   ChevronRight,
+  Copy,
   Download,
   Eye,
   Loader2,
@@ -13,6 +14,7 @@ import {
   Pause,
   RotateCcw,
   Scissors,
+  Share2,
   Type,
   Subtitles,
 } from "lucide-react";
@@ -51,6 +53,8 @@ type ClipResult = {
   overallScore: number;
   rationale: string;
   title: string;
+  hookText?: string;
+  descriptions?: { tiktok: string; instagram: string; youtube: string };
   thumbnailUrl?: string;
   hookApplied?: boolean;
 };
@@ -635,7 +639,10 @@ function EditorContent() {
                 <Scissors className="mr-1 h-3.5 w-3.5" /> Trim
               </TabsTrigger>
               <TabsTrigger value="subs" className="flex-1 text-xs">
-                <Subtitles className="mr-1 h-3.5 w-3.5" /> Subtitulos
+                <Subtitles className="mr-1 h-3.5 w-3.5" /> Subs
+              </TabsTrigger>
+              <TabsTrigger value="copys" className="flex-1 text-xs">
+                <Share2 className="mr-1 h-3.5 w-3.5" /> Copys
               </TabsTrigger>
             </TabsList>
 
@@ -741,6 +748,58 @@ function EditorContent() {
                   <Subtitles className="mx-auto h-8 w-8 text-(--muted-fg) mb-2" />
                   <p className="text-xs text-(--muted-fg)">
                     Sin datos de transcripcion para este rango.
+                  </p>
+                </div>
+              )}
+            </TabsContent>
+
+            {/* Tab: Platform Copys */}
+            <TabsContent value="copys" className="mt-4 space-y-4">
+              {activeClip?.hookText && (
+                <div className="rounded-lg bg-yellow-50 border border-yellow-200 p-3">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-yellow-700">
+                      Hook Text Overlay
+                    </span>
+                  </div>
+                  <p className="text-sm font-bold text-yellow-900">{activeClip.hookText}</p>
+                </div>
+              )}
+
+              {activeClip?.descriptions ? (
+                <div className="space-y-3">
+                  {([
+                    { key: "tiktok" as const, label: "TikTok", color: "text-black", bg: "bg-gray-50 border-gray-200" },
+                    { key: "instagram" as const, label: "Instagram", color: "text-pink-600", bg: "bg-pink-50 border-pink-200" },
+                    { key: "youtube" as const, label: "YouTube", color: "text-red-600", bg: "bg-red-50 border-red-200" },
+                  ] as const).map(({ key, label, color, bg }) => {
+                    const text = activeClip.descriptions?.[key];
+                    if (!text) return null;
+                    return (
+                      <div key={key} className={`rounded-lg border p-3 ${bg}`}>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className={`text-[10px] font-semibold uppercase tracking-wider ${color}`}>
+                            {label}
+                          </span>
+                          <button
+                            className="text-[10px] text-(--muted-fg) hover:text-(--foreground) flex items-center gap-1 transition-colors"
+                            onClick={() => {
+                              navigator.clipboard.writeText(text);
+                            }}
+                          >
+                            <Copy className="h-3 w-3" /> Copiar
+                          </button>
+                        </div>
+                        <p className="text-xs leading-relaxed text-(--foreground)">{text}</p>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="rounded-lg bg-(--surface-2) border border-(--line) p-4 text-center">
+                  <Share2 className="mx-auto h-8 w-8 text-(--muted-fg) mb-2" />
+                  <p className="text-xs text-(--muted-fg)">
+                    Sin descripciones generadas para este clip.
                   </p>
                 </div>
               )}

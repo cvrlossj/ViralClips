@@ -48,6 +48,7 @@ next-env.d.ts
 /storage/sources/*
 /storage/jobs/*
 /storage/frames/*
+/storage/benchmarks/*
 !/storage/uploads/.gitkeep
 !/storage/outputs/.gitkeep
 !/storage/tmp/.gitkeep

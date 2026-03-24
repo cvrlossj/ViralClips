@@ -89,6 +89,7 @@ export async function POST(request: Request) {
       splitScreen: manifest.settings.splitScreen,
       srcWidth,
       srcHeight,
+      hookText: clip.hookText || undefined,
     });
 
     // Clean up temp subtitle file

@@ -262,9 +262,55 @@ export function buildPresetAssHeader(preset: CaptionPreset, fontSize: number): s
 
 export type WordTimestamp = { word: string; start: number; end: number };
 
+// Max characters per subtitle line (like OpenShorts: prevents crowding)
+const MAX_CHARS_PER_LINE = 22;
+// Max duration per subtitle group (prevents reader overload)
+const MAX_LINE_DURATION = 2.5;
+
+/**
+ * Group words into lines using smart grouping:
+ * - Max characters per line (prevents text from going off-screen)
+ * - Max duration per group (prevents reader fatigue)
+ * - Preset wordsPerLine as hard cap
+ * Inspired by OpenShorts' max_chars=20, max_duration=2.0 approach.
+ */
+function groupWordsIntoLines(words: WordTimestamp[], preset: CaptionPreset): WordTimestamp[][] {
+  const lines: WordTimestamp[][] = [];
+  let currentLine: WordTimestamp[] = [];
+  let currentChars = 0;
+  let lineStartTime = words[0]?.start ?? 0;
+
+  for (const w of words) {
+    const wordLen = w.word.length;
+    const lineDuration = w.end - lineStartTime;
+
+    const shouldBreak =
+      currentLine.length >= preset.wordsPerLine ||
+      (currentChars + wordLen + 1 > MAX_CHARS_PER_LINE && currentLine.length > 0) ||
+      (lineDuration > MAX_LINE_DURATION && currentLine.length > 0);
+
+    if (shouldBreak) {
+      lines.push(currentLine);
+      currentLine = [];
+      currentChars = 0;
+      lineStartTime = w.start;
+    }
+
+    currentLine.push(w);
+    currentChars += wordLen + (currentLine.length > 1 ? 1 : 0); // +1 for space
+  }
+
+  if (currentLine.length > 0) {
+    lines.push(currentLine);
+  }
+
+  return lines;
+}
+
 /**
  * Generate karaoke ASS subtitles using a caption preset.
  * Each word gets highlighted with the preset's active style when spoken.
+ * Uses smart grouping (chars + duration) instead of fixed word count.
  */
 export function wordsToPresetAss(
   words: WordTimestamp[],
@@ -273,10 +319,7 @@ export function wordsToPresetAss(
 ): string {
   if (words.length === 0) return "";
 
-  const lines: WordTimestamp[][] = [];
-  for (let i = 0; i < words.length; i += preset.wordsPerLine) {
-    lines.push(words.slice(i, i + preset.wordsPerLine));
-  }
+  const lines = groupWordsIntoLines(words, preset);
 
   const dialogues: string[] = [];
 
