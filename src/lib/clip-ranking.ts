@@ -14,10 +14,22 @@ export type ClipScores = {
   completeness: number; // 0-100: Does the clip tell a complete micro-story?
 };
 
+export type PlatformDescriptions = {
+  tiktok: string;
+  instagram: string;
+  youtube: string;
+};
+
 export type DetectedMoment = {
   start: number;
   end: number;
   title: string;
+  /** Short punchy hook text (2-5 words) for overlay */
+  hookText: string;
+  /** Best second within the clip for zoompan emphasis */
+  zoomTimestamp: number | null;
+  /** Platform-specific descriptions/captions */
+  descriptions: PlatformDescriptions;
   scores: ClipScores;
   overallScore: number;
   rationale: string;
@@ -171,10 +183,12 @@ export async function detectMomentsWithLlm(params: {
   videoDuration: number;
   maxClips: number;
   visualContext?: string;
+  /** Real TikTok benchmark data to calibrate scoring */
+  benchmarkContext?: string;
 }): Promise<DetectedMoment[] | null> {
   if (!llmClient) return null;
 
-  const { segments, sceneChanges, adSegments, videoDuration, maxClips, visualContext } = params;
+  const { segments, sceneChanges, adSegments, videoDuration, maxClips, visualContext, benchmarkContext } = params;
   if (segments.length === 0) return null;
 
   const transcript = buildTimestampedTranscript(segments);
@@ -194,12 +208,17 @@ export async function detectMomentsWithLlm(params: {
     ? `\n\n${visualContext}`
     : "";
 
+  // Real TikTok benchmark data (from TikTok Scraper7 API)
+  const benchmarkStr = benchmarkContext
+    ? `\n\n${benchmarkContext}`
+    : "";
+
   const prompt = `Eres un editor experto en contenido viral para YouTube Shorts, TikTok e Instagram Reels.
 
 TRANSCRIPCION COMPLETA CON TIMESTAMPS:
 ${transcript}
 
-DURACION TOTAL DEL VIDEO: ${formatTimecode(videoDuration)}${adRangesStr}${sceneStr}${visualStr}
+DURACION TOTAL DEL VIDEO: ${formatTimecode(videoDuration)}${adRangesStr}${sceneStr}${visualStr}${benchmarkStr}
 
 TU TAREA: Identifica hasta ${maxClips} momentos VIRALES del video. Cada momento debe ser un clip auto-contenido con DURACION VARIABLE (minimo 15 segundos, maximo 180 segundos).
 
@@ -213,16 +232,35 @@ REGLAS CRITICAS:
 7. COMBINA el analisis de audio (transcripcion) con el analisis VISUAL. Los mejores clips tienen AMBOS: dialogo interesante + accion visual intensa.
 8. Si hay zonas visualmente intensas, PRIORIZA clips que las incluyan. Un momento con reacciones faciales extremas + dialogo gracioso = clip viral garantizado.
 
+⚠️ REGLA CRITICA DE CONTEXTO — MUY IMPORTANTE:
+9. NUNCA empieces un clip en el momento exacto de la risa, reaccion o punchline. SIEMPRE incluye el SETUP/CONTEXTO ANTES del momento clave. El espectador necesita entender POR QUE es gracioso/impactante.
+   - MAL: Clip empieza cuando alguien ya se esta riendo → el espectador no entiende nada
+   - BIEN: Clip empieza 5-15 segundos ANTES, cuando se plantea la situacion → el espectador entiende el contexto y cuando llega la risa/reaccion, el impacto es 10x mayor
+   - Piensa como un COMEDIANTE: setup → buildup → punchline → reaccion. El clip DEBE incluir las 4 fases.
+   - Si hay una historia/anecdota, incluye el INICIO de la anecdota, no solo el final.
+   - Si hay una broma, incluye la PREGUNTA o situacion que genera la broma.
+   - El clip ideal: el espectador entiende la situacion en los primeros 5s, se engancha, y el payoff llega despues.
+10. Varia los TIPOS de clips. No selecciones solo momentos de risa. Incluye: momentos de tension, revelaciones, historias emotivas, confrontaciones, opiniones polemicas, momentos WTF, fails, reacciones genuinas.
+
 SCORING (0-100 cada uno):
 - hook: Los primeros 3 segundos del clip detienen el scroll? Hay una frase gancho, sorpresa, o tension inmediata? BONUS si hay accion visual inmediata.
 - flow: El ritmo se mantiene durante todo el clip? Hay dinamismo, sin silencios muertos? Considerar variedad visual.
 - engagement: Hay emocion fuerte? Humor, drama, sorpresa, tension? El espectador siente algo? Considerar reacciones faciales visibles.
-- completeness: El clip cuenta una micro-historia completa? Tiene inicio, desarrollo y cierre/remate?
+- completeness: El clip cuenta una micro-historia COMPLETA con CONTEXTO? Tiene setup, buildup, payoff y reaccion? PENALIZA clips que empiezan en el punchline sin contexto.
+
+PARA CADA MOMENTO GENERA:
+- title: Titulo viral corto (6-8 palabras, sin emojis/hashtags)
+- hookText: Texto ULTRA-CORTO (2-5 palabras MAX) que aparecera como overlay visual al inicio. Debe generar curiosidad INMEDIATA. Ejemplos: "NO PUEDE SER", "MIRA ESTO", "SE ARREPINTIO", "LO QUE HIZO DESPUES"
+- zoomTimestamp: El segundo EXACTO dentro del clip donde ocurre el momento mas intenso (para aplicar zoom). Debe ser un timestamp absoluto del video original.
+- descriptions: Objeto con 3 descripciones adaptadas a cada plataforma:
+  - tiktok: Caption corta y casual con CTA. Ejemplo: "No me esperaba este final... Sigueme para mas 🔥 #viral"
+  - instagram: Caption media, profesional, con hashtags. Ejemplo: "Este momento lo cambio todo 🎬 #shorts #viral #clips"
+  - youtube: Descripcion para YouTube Shorts, clickbait pero real. Ejemplo: "Nadie se esperaba lo que paso en el segundo 15..."
 
 RESPONDE UNICAMENTE CON JSON VALIDO, SIN MARKDOWN NI TEXTO ADICIONAL:
-{"moments":[{"start":12.5,"end":38.2,"title":"Titulo viral corto 6-8 palabras","hook":85,"flow":78,"engagement":92,"completeness":80,"rationale":"Por que este momento es viral"}]}
+{"moments":[{"start":12.5,"end":38.2,"title":"Titulo viral corto","hookText":"NO PUEDE SER","zoomTimestamp":25.3,"descriptions":{"tiktok":"Caption TikTok...","instagram":"Caption Instagram...","youtube":"Caption YouTube..."},"hook":85,"flow":78,"engagement":92,"completeness":80,"rationale":"Por que este momento es viral"}]}
 
-Los timestamps deben ser en SEGUNDOS (decimal). El titulo NO debe tener emojis ni hashtags.`;
+Los timestamps deben ser en SEGUNDOS (decimal).`;
 
   try {
     const response = await llmClient.chat.completions.create({
@@ -248,6 +286,9 @@ Los timestamps deben ser en SEGUNDOS (decimal). El titulo NO debe tener emojis n
         start?: number;
         end?: number;
         title?: string;
+        hookText?: string;
+        zoomTimestamp?: number;
+        descriptions?: { tiktok?: string; instagram?: string; youtube?: string };
         hook?: number;
         flow?: number;
         engagement?: number;
@@ -289,10 +330,26 @@ Los timestamps deben ser en SEGUNDOS (decimal). El titulo NO debe tener emojis n
           .join(" ")
           .trim();
 
+        // Parse zoom timestamp (must be within clip bounds)
+        const rawZoom = Number(m.zoomTimestamp);
+        const zoomTimestamp = Number.isFinite(rawZoom) && rawZoom >= start && rawZoom <= end
+          ? Number(rawZoom.toFixed(2))
+          : null;
+
+        // Parse platform descriptions
+        const descriptions: PlatformDescriptions = {
+          tiktok: String(m.descriptions?.tiktok ?? "").trim().slice(0, 300),
+          instagram: String(m.descriptions?.instagram ?? "").trim().slice(0, 300),
+          youtube: String(m.descriptions?.youtube ?? "").trim().slice(0, 300),
+        };
+
         return {
           start: Number(start.toFixed(2)),
           end: Number(end.toFixed(2)),
           title: String(m.title ?? "").trim().slice(0, 80) || "Clip viral",
+          hookText: String(m.hookText ?? "").trim().slice(0, 40).toUpperCase() || "",
+          zoomTimestamp,
+          descriptions,
           scores,
           overallScore,
           rationale: String(m.rationale ?? "").trim(),
@@ -426,6 +483,9 @@ export function buildHeuristicMoments(params: {
         start: Number(start.toFixed(2)),
         end: Number(end.toFixed(2)),
         title: "Clip viral",
+        hookText: "",
+        zoomTimestamp: null,
+        descriptions: { tiktok: "", instagram: "", youtube: "" },
         scores: {
           hook: hookScore,
           flow: flowScore,
