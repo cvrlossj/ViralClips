@@ -695,6 +695,7 @@ export default function Home() {
                     { label: "Deteccion de escenas", enabled: true },
                     { label: "Scoring multi-dimensional", enabled: true },
                     { label: "Benchmark TikTok", enabled: !!activeBenchmark },
+                    { label: "Anti-copyright (pitch+color+watermark)", enabled: true },
                     { label: "Split-screen auto", enabled: splitScreen },
                   ].map(({ label, enabled }) => (
                     <div key={label} className="flex items-center justify-between">

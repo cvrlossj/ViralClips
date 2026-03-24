@@ -19,7 +19,7 @@ import {
   getMediaDurationSeconds,
   runFfmpeg,
 } from "@/lib/ffmpeg";
-import { benchmarksDir, framesDir, jobsDir, outputDir, sourcesDir, tempDir, uploadDir } from "@/lib/paths";
+import { benchmarksDir, framesDir, jobsDir, outputDir, sourcesDir, storageRoot, tempDir, uploadDir } from "@/lib/paths";
 import {
   analyzeVideoVisually,
   buildVisualContextForPrompt,
@@ -355,6 +355,20 @@ async function transcribeClipAudio(params: {
 // Single clip renderer — used by both the main pipeline and re-render API
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Anti-copyright: watermark PNG path
+// ---------------------------------------------------------------------------
+const WATERMARK_PATH = path.join(storageRoot, "watermark", "marca_de_agua.png");
+
+async function watermarkExists(): Promise<boolean> {
+  try {
+    await fs.access(WATERMARK_PATH);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function renderSingleClip(params: {
   sourceVideoPath: string;
   outputPath: string;
@@ -371,14 +385,15 @@ export async function renderSingleClip(params: {
   /** Zoom timestamp relative to clip start (seconds) */
   zoomAt?: number;
 }): Promise<void> {
-  const { sourceVideoPath, outputPath, start, duration, title, watermark, subtitlePath, splitScreen } = params;
-  const safeTitle = ensureTextForDrawText(title);
-  const safeWatermark = ensureTextForDrawText(watermark);
+  const { sourceVideoPath, outputPath, start, duration, subtitlePath, splitScreen } = params;
 
   // ---------------------------------------------------------------------------
   // Full 9:16 (1080x1920) — NO black bars. Video fills the entire frame.
-  // Title + watermark float as transparent overlays on top of the video.
-  // This matches the TikTok/Reels/Shorts standard used by top creators.
+  // ---------------------------------------------------------------------------
+  // Anti-copyright protections applied:
+  // 1. Pitch shift +2% on audio (breaks audio fingerprint)
+  // 2. Subtle color shift (saturation +0.08, brightness +0.02)
+  // 3. Watermark PNG overlay (marca_de_agua.png)
   // ---------------------------------------------------------------------------
 
   const OUT_W = 1080;
@@ -386,6 +401,9 @@ export async function renderSingleClip(params: {
 
   const isLandscape = params.srcWidth > params.srcHeight && params.srcWidth > 0;
   const applySplit = splitScreen && isLandscape;
+
+  // Check if watermark image exists
+  const hasWatermark = await watermarkExists();
 
   // Hook text overlay: big text shown in first 3 seconds
   const hookTextFilter = params.hookText
@@ -401,9 +419,17 @@ export async function renderSingleClip(params: {
       })()
     : "";
 
-  // Overlay filters: only subtitles + hook text. No title/watermark bars.
+  // Anti-copyright: subtle color shift (slightly warmer + more saturated)
+  const colorShiftFilter = "eq=saturation=1.08:brightness=0.02";
+
+  // Anti-copyright: pitch shift +2% (imperceptible but breaks Content ID)
+  // asetrate changes sample rate interpretation → pitch up, then aresample restores correct rate
+  const audioFilter = "asetrate=44100*1.02,aresample=44100";
+
+  // Build overlay filters (subtitles + hook text + color shift)
   function buildOverlayFilters(): string[] {
     const f: string[] = [];
+    f.push(colorShiftFilter);
     if (subtitlePath) {
       f.push(`subtitles='${ensurePathForSubtitlesFilter(subtitlePath)}'`);
     }
@@ -414,23 +440,42 @@ export async function renderSingleClip(params: {
   if (applySplit) {
     const halfH = Math.floor(OUT_H / 2);
     const overlayFilters = buildOverlayFilters();
-    // Split-screen divider line
     overlayFilters.push(
       `drawbox=x=0:y=${halfH - 2}:w=iw:h=4:color=white@0.4:t=fill`,
     );
 
     const overlayChain = overlayFilters.length > 0 ? `,${overlayFilters.join(",")}` : "";
-    const filterComplex = [
-      `[0:v]split[a][b]`,
-      `[a]crop=iw/2:ih:0:0,scale=${OUT_W}:${halfH}[left]`,
-      `[b]crop=iw/2:ih:iw/2:0,scale=${OUT_W}:${halfH}[right]`,
-      `[left][right]vstack${overlayChain}[out]`,
-    ].join(";");
 
-    await runFfmpeg([
+    // Build inputs
+    const inputs = [
       "-y", "-ss", start.toFixed(2), "-t", duration.toFixed(2),
       "-i", sourceVideoPath,
+    ];
+
+    let filterComplex: string;
+    if (hasWatermark) {
+      inputs.push("-i", WATERMARK_PATH);
+      filterComplex = [
+        `[0:v]split[a][b]`,
+        `[a]crop=iw/2:ih:0:0,scale=${OUT_W}:${halfH}[left]`,
+        `[b]crop=iw/2:ih:iw/2:0,scale=${OUT_W}:${halfH}[right]`,
+        `[left][right]vstack${overlayChain}[stacked]`,
+        `[1:v]scale=160:-1,format=rgba,colorchannelmixer=aa=0.7[wm]`,
+        `[stacked][wm]overlay=W-w-30:H-h-30[out]`,
+      ].join(";");
+    } else {
+      filterComplex = [
+        `[0:v]split[a][b]`,
+        `[a]crop=iw/2:ih:0:0,scale=${OUT_W}:${halfH}[left]`,
+        `[b]crop=iw/2:ih:iw/2:0,scale=${OUT_W}:${halfH}[right]`,
+        `[left][right]vstack${overlayChain}[out]`,
+      ].join(";");
+    }
+
+    await runFfmpeg([
+      ...inputs,
       "-filter_complex", filterComplex,
+      "-af", audioFilter,
       "-map", "[out]", "-map", "0:a?",
       "-c:v", "libx264", "-preset", clipVideoPreset, "-crf", clipVideoCrf,
       "-pix_fmt", "yuv420p",
@@ -442,24 +487,53 @@ export async function renderSingleClip(params: {
     const filters = buildOverlayFilters();
 
     // Scale to fill 1080x1920 (9:16) — crop to avoid black bars
-    let vf = zoomFilter
+    const scaleChain = zoomFilter
       ? `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},${zoomFilter}`
       : `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H}`;
 
-    if (filters.length > 0) {
-      vf += `,${filters.join(",")}`;
-    }
-
-    await runFfmpeg([
+    const inputs = [
       "-y", "-ss", start.toFixed(2), "-t", duration.toFixed(2),
       "-i", sourceVideoPath,
-      "-vf", vf,
-      "-c:v", "libx264", "-preset", clipVideoPreset, "-crf", clipVideoCrf,
-      "-pix_fmt", "yuv420p",
-      "-c:a", "aac", "-b:a", clipAudioBitrate,
-      "-movflags", "+faststart",
-      outputPath,
-    ]);
+    ];
+
+    if (hasWatermark) {
+      // Use filter_complex for watermark overlay
+      inputs.push("-i", WATERMARK_PATH);
+
+      const videoChain = `[0:v]${scaleChain}${filters.length > 0 ? `,${filters.join(",")}` : ""}[base]`;
+      const wmChain = `[1:v]scale=160:-1,format=rgba,colorchannelmixer=aa=0.7[wm]`;
+      const overlayChain = `[base][wm]overlay=W-w-30:H-h-30[out]`;
+      const filterComplex = [videoChain, wmChain, overlayChain].join(";");
+
+      await runFfmpeg([
+        ...inputs,
+        "-filter_complex", filterComplex,
+        "-af", audioFilter,
+        "-map", "[out]", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", clipVideoPreset, "-crf", clipVideoCrf,
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", clipAudioBitrate,
+        "-movflags", "+faststart",
+        outputPath,
+      ]);
+    } else {
+      // No watermark — simple -vf chain
+      let vf = scaleChain;
+      if (filters.length > 0) {
+        vf += `,${filters.join(",")}`;
+      }
+
+      await runFfmpeg([
+        ...inputs,
+        "-vf", vf,
+        "-af", audioFilter,
+        "-c:v", "libx264", "-preset", clipVideoPreset, "-crf", clipVideoCrf,
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", clipAudioBitrate,
+        "-movflags", "+faststart",
+        outputPath,
+      ]);
+    }
   }
 }
 
@@ -1027,6 +1101,7 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         ? `Cambios de escena detectados: ${sceneChanges.length}.`
         : "Sin cambios de escena detectados.",
       ...diagnostics,
+      "Anti-copyright: pitch shift +2%, color shift, watermark overlay.",
       "Formato de salida: vertical 1080x1920.",
     ];
 
