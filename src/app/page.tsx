@@ -3,17 +3,21 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
+  BarChart3,
   CheckCircle2,
   Clock,
+  Copy,
   Cpu,
   Download,
-
   Loader2,
   Pencil,
+  Search,
   Settings2,
   Trash2,
+  TrendingUp,
   Type,
   Upload,
+  User,
   XCircle,
   Zap,
 } from "lucide-react";
@@ -51,6 +55,8 @@ type ClipResult = {
   overallScore: number;
   rationale: string;
   title: string;
+  hookText: string;
+  descriptions: { tiktok: string; instagram: string; youtube: string };
   thumbnailUrl?: string;
   hookApplied?: boolean;
 };
@@ -59,6 +65,31 @@ type ProcessResponse = {
   jobId: string;
   clips: ClipResult[];
   notes: string[];
+};
+
+type ViralBenchmark = {
+  avgViews: number;
+  avgLikes: number;
+  avgShares: number;
+  avgComments: number;
+  avgDuration: number;
+  avgEngagementRate: number;
+  durationBuckets: { range: string; avgViews: number; count: number }[];
+  topVideos: { id: string; title: string; views: number; duration: number; engagementRate: number }[];
+  analyzedAt: string;
+  totalAnalyzed: number;
+};
+
+type TikTokSearchResult = {
+  id: string;
+  title: string;
+  duration: number;
+  playCount: number;
+  likeCount: number;
+  shareCount: number;
+  commentCount: number;
+  author: string;
+  coverUrl: string;
 };
 
 function formatSeconds(s: number) {
@@ -100,6 +131,16 @@ export default function Home() {
     Array<{ jobId: string; sourceFileName: string; clipCount: number; createdAt: string }>
   >([]);
 
+  // TikTok Analytics state
+  const [tiktokQuery, setTiktokQuery] = useState("");
+  const [tiktokCreator, setTiktokCreator] = useState("");
+  const [tiktokLoading, setTiktokLoading] = useState(false);
+  const [tiktokVideos, setTiktokVideos] = useState<TikTokSearchResult[]>([]);
+  const [tiktokBenchmark, setTiktokBenchmark] = useState<ViralBenchmark | null>(null);
+  const [tiktokSource, setTiktokSource] = useState<string | null>(null);
+  const [activeBenchmark, setActiveBenchmark] = useState<{ benchmark: ViralBenchmark; source: string; savedAt: string } | null>(null);
+  const [tiktokError, setTiktokError] = useState<string | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -132,6 +173,12 @@ export default function Home() {
     fetch("/api/jobs", { cache: "no-store" })
       .then((r) => r.json())
       .then((data) => { if (mounted) setPreviousJobs(data); })
+      .catch(() => {});
+
+    // Load active TikTok benchmark
+    fetch("/api/tiktok/benchmark", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((data) => { if (mounted && data.benchmark) setActiveBenchmark(data); })
       .catch(() => {});
 
     return () => { mounted = false; };
@@ -234,6 +281,77 @@ export default function Home() {
       setLoading(false);
       setProcessingStartedAt(null);
     }
+  };
+
+  const handleTiktokSearch = async () => {
+    if (!tiktokQuery.trim()) return;
+    setTiktokLoading(true);
+    setTiktokError(null);
+    setTiktokVideos([]);
+    setTiktokBenchmark(null);
+    try {
+      const res = await fetch("/api/tiktok/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ keywords: tiktokQuery.trim(), count: 30 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Error en busqueda");
+      setTiktokVideos(data.videos ?? []);
+      setTiktokBenchmark(data.benchmark ?? null);
+      setTiktokSource(`Busqueda: "${tiktokQuery.trim()}"`);
+    } catch (err) {
+      setTiktokError(err instanceof Error ? err.message : "Error desconocido");
+    } finally {
+      setTiktokLoading(false);
+    }
+  };
+
+  const handleTiktokCreator = async () => {
+    if (!tiktokCreator.trim()) return;
+    setTiktokLoading(true);
+    setTiktokError(null);
+    setTiktokVideos([]);
+    setTiktokBenchmark(null);
+    try {
+      const res = await fetch("/api/tiktok/creator", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: tiktokCreator.trim(), count: 30 }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Error analizando creador");
+      setTiktokVideos(data.videos ?? []);
+      setTiktokBenchmark(data.benchmark ?? null);
+      setTiktokSource(`Creador: @${tiktokCreator.trim().replace(/^@/, "")}`);
+    } catch (err) {
+      setTiktokError(err instanceof Error ? err.message : "Error desconocido");
+    } finally {
+      setTiktokLoading(false);
+    }
+  };
+
+  const handleActivateBenchmark = async () => {
+    if (!tiktokBenchmark) return;
+    try {
+      const res = await fetch("/api/tiktok/benchmark", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ benchmark: tiktokBenchmark, source: tiktokSource }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Error guardando benchmark");
+      setActiveBenchmark({ benchmark: tiktokBenchmark, source: tiktokSource ?? "", savedAt: data.savedAt });
+    } catch (err) {
+      setTiktokError(err instanceof Error ? err.message : "Error desconocido");
+    }
+  };
+
+  const handleDeactivateBenchmark = async () => {
+    try {
+      await fetch("/api/tiktok/benchmark", { method: "DELETE" });
+      setActiveBenchmark(null);
+    } catch { /* ignore */ }
   };
 
   return (
@@ -565,13 +683,18 @@ export default function Home() {
                     { label: `Caption preset: ${captionPreset}`, enabled: true },
                     { label: "Hook optimizer (spoiler hook)", enabled: hookOptimizer },
                     { label: "Thumbnails automaticos", enabled: true },
+                    { label: "Hook text overlay", enabled: true },
+                    { label: "Zoom dinamico en momentos clave", enabled: true },
+                    { label: "Copys multi-plataforma (TikTok/IG/YT)", enabled: true },
                     { label: "Subtitulos karaoke", enabled: true },
+                    { label: "Agrupacion inteligente de subtitulos", enabled: true },
                     { label: "Auto-titulo viral", enabled: autoTitle },
                     { label: "Duracion variable por contenido", enabled: true },
                     { label: "Filtro anti-publicidad", enabled: true },
                     { label: "Corte por frase", enabled: true },
                     { label: "Deteccion de escenas", enabled: true },
                     { label: "Scoring multi-dimensional", enabled: true },
+                    { label: "Benchmark TikTok", enabled: !!activeBenchmark },
                     { label: "Split-screen auto", enabled: splitScreen },
                   ].map(({ label, enabled }) => (
                     <div key={label} className="flex items-center justify-between">
@@ -632,6 +755,182 @@ export default function Home() {
             )}
           </div>
         </div>
+
+        {/* TikTok Analytics — benchmark calibration */}
+        <section className="mt-8">
+          <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="flex items-center gap-2 text-xl">
+                <TrendingUp className="h-5 w-5 text-(--accent)" />
+                TikTok Analytics
+              </CardTitle>
+              <CardDescription>
+                Analiza contenido trending y creadores top para calibrar el scoring con datos reales.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              {/* Active benchmark indicator */}
+              {activeBenchmark && (
+                <div className="flex items-center justify-between rounded-lg border border-(--accent-2)/30 bg-(--accent-2)/5 px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <BarChart3 className="h-4 w-4 text-(--accent-2)" />
+                    <div>
+                      <p className="text-sm font-medium text-(--accent-2)">Benchmark activo</p>
+                      <p className="text-xs text-(--muted-fg)">
+                        {activeBenchmark.source} · {activeBenchmark.benchmark.totalAnalyzed} videos · Engagement: {(activeBenchmark.benchmark.avgEngagementRate * 100).toFixed(1)}%
+                      </p>
+                    </div>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={handleDeactivateBenchmark}>
+                    Desactivar
+                  </Button>
+                </div>
+              )}
+
+              <Tabs defaultValue="trending">
+                <TabsList className="w-full sm:w-auto">
+                  <TabsTrigger value="trending" className="flex items-center gap-1.5">
+                    <Search className="h-3.5 w-3.5" />
+                    Trending
+                  </TabsTrigger>
+                  <TabsTrigger value="creator" className="flex items-center gap-1.5">
+                    <User className="h-3.5 w-3.5" />
+                    Creador
+                  </TabsTrigger>
+                </TabsList>
+
+                <TabsContent value="trending" className="space-y-3 mt-3">
+                  <div className="flex gap-2">
+                    <Input
+                      placeholder="Buscar trending: podcast, comedia, gaming..."
+                      value={tiktokQuery}
+                      onChange={(e) => setTiktokQuery(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && handleTiktokSearch()}
+                      disabled={tiktokLoading}
+                    />
+                    <Button onClick={handleTiktokSearch} disabled={tiktokLoading || !tiktokQuery.trim()}>
+                      {tiktokLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                    </Button>
+                  </div>
+                  <p className="text-xs text-(--muted-fg)">
+                    Busca por nicho o keywords para ver que contenido esta funcionando en TikTok ahora mismo.
+                  </p>
+                </TabsContent>
+
+                <TabsContent value="creator" className="space-y-3 mt-3">
+                  <div className="flex gap-2">
+                    <Input
+                      placeholder="@username del creador"
+                      value={tiktokCreator}
+                      onChange={(e) => setTiktokCreator(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && handleTiktokCreator()}
+                      disabled={tiktokLoading}
+                    />
+                    <Button onClick={handleTiktokCreator} disabled={tiktokLoading || !tiktokCreator.trim()}>
+                      {tiktokLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                    </Button>
+                  </div>
+                  <p className="text-xs text-(--muted-fg)">
+                    Analiza los videos de un creador top en tu nicho para aprender que les funciona.
+                  </p>
+                </TabsContent>
+              </Tabs>
+
+              {tiktokError && (
+                <div className="flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-3 text-sm text-red-400">
+                  <XCircle className="h-4 w-4 shrink-0" />
+                  {tiktokError}
+                </div>
+              )}
+
+              {/* Benchmark results */}
+              {tiktokBenchmark && tiktokBenchmark.totalAnalyzed > 0 && (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-semibold flex items-center gap-1.5">
+                      <BarChart3 className="h-4 w-4 text-(--accent)" />
+                      Benchmark: {tiktokSource}
+                    </h3>
+                    <Button size="sm" onClick={handleActivateBenchmark}>
+                      <Zap className="mr-1 h-3.5 w-3.5" />
+                      Activar benchmark
+                    </Button>
+                  </div>
+
+                  {/* Key metrics */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    {[
+                      { label: "Views promedio", value: tiktokBenchmark.avgViews.toLocaleString() },
+                      { label: "Likes promedio", value: tiktokBenchmark.avgLikes.toLocaleString() },
+                      { label: "Shares promedio", value: tiktokBenchmark.avgShares.toLocaleString() },
+                      { label: "Engagement", value: `${(tiktokBenchmark.avgEngagementRate * 100).toFixed(1)}%` },
+                    ].map(({ label, value }) => (
+                      <div key={label} className="rounded-lg border border-(--line) bg-(--surface-2) px-3 py-2.5 text-center">
+                        <p className="text-xs text-(--muted-fg)">{label}</p>
+                        <p className="text-lg font-bold font-mono text-(--accent)">{value}</p>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Duration buckets */}
+                  {tiktokBenchmark.durationBuckets.length > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-xs font-semibold text-(--muted-fg)">Duracion vs Performance</p>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                        {tiktokBenchmark.durationBuckets.map((b) => {
+                          const maxViews = Math.max(...tiktokBenchmark.durationBuckets.map((x) => x.avgViews));
+                          const isTop = b.avgViews === maxViews;
+                          return (
+                            <div
+                              key={b.range}
+                              className={`rounded-lg border px-3 py-2 text-center ${
+                                isTop
+                                  ? "border-(--accent)/50 bg-(--accent)/10"
+                                  : "border-(--line) bg-(--surface-2)"
+                              }`}
+                            >
+                              <p className="text-xs font-semibold">{b.range}</p>
+                              <p className={`text-sm font-mono font-bold ${isTop ? "text-(--accent)" : ""}`}>
+                                {b.avgViews.toLocaleString()} views
+                              </p>
+                              <p className="text-[10px] text-(--muted-fg)">{b.count} videos</p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Top videos */}
+                  {tiktokVideos.length > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-xs font-semibold text-(--muted-fg)">Top videos encontrados</p>
+                      <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                        {tiktokVideos.slice(0, 8).map((v) => (
+                          <div
+                            key={v.id}
+                            className="flex items-center justify-between rounded-lg border border-(--line) bg-(--surface-2) px-3 py-2 text-xs"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate font-medium">{v.title || "Sin titulo"}</p>
+                              <p className="text-(--muted-fg)">
+                                @{v.author} · {v.duration}s
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-3 ml-3 shrink-0 font-mono text-(--muted-fg)">
+                              <span>{v.playCount.toLocaleString()} views</span>
+                              <span>{v.likeCount.toLocaleString()} likes</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </section>
 
         {/* Clips grid — full width */}
         {response && response.clips.length > 0 && (
@@ -738,10 +1037,48 @@ export default function Home() {
                       {clip.durationSeconds.toFixed(0)}s
                     </p>
 
+                    {clip.hookText && (
+                      <div className="flex items-center gap-1.5">
+                        <Badge className="bg-yellow-500/90 text-black text-[10px] font-bold border-0 shrink-0">
+                          HOOK
+                        </Badge>
+                        <span className="text-xs font-bold truncate">{clip.hookText}</span>
+                      </div>
+                    )}
+
                     {clip.rationale && (
                       <p className="text-xs text-(--muted-fg) leading-5 line-clamp-2">
                         {clip.rationale}
                       </p>
+                    )}
+
+                    {/* Platform descriptions */}
+                    {(clip.descriptions?.tiktok || clip.descriptions?.instagram || clip.descriptions?.youtube) && (
+                      <details className="text-xs">
+                        <summary className="cursor-pointer text-(--muted-fg) hover:text-(--foreground) transition-colors">
+                          Copys por plataforma
+                        </summary>
+                        <div className="mt-2 space-y-1.5 pl-1">
+                          {clip.descriptions.tiktok && (
+                            <div>
+                              <span className="font-semibold text-(--accent)">TikTok:</span>{" "}
+                              <span className="text-(--muted-fg)">{clip.descriptions.tiktok}</span>
+                            </div>
+                          )}
+                          {clip.descriptions.instagram && (
+                            <div>
+                              <span className="font-semibold text-pink-500">Instagram:</span>{" "}
+                              <span className="text-(--muted-fg)">{clip.descriptions.instagram}</span>
+                            </div>
+                          )}
+                          {clip.descriptions.youtube && (
+                            <div>
+                              <span className="font-semibold text-red-500">YouTube:</span>{" "}
+                              <span className="text-(--muted-fg)">{clip.descriptions.youtube}</span>
+                            </div>
+                          )}
+                        </div>
+                      </details>
                     )}
 
                     <Button asChild variant="secondary" size="sm" className="w-full">
