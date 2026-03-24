@@ -9,3 +9,4 @@ export const tempDir = path.join(storageRoot, "tmp");
 export const sourcesDir = path.join(storageRoot, "sources");
 export const jobsDir = path.join(storageRoot, "jobs");
 export const framesDir = path.join(storageRoot, "frames");
+export const benchmarksDir = path.join(storageRoot, "benchmarks");

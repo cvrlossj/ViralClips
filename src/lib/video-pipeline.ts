@@ -8,6 +8,7 @@ import {
   detectSceneChangeTimes,
   type ClipScores,
   type DetectedMoment,
+  type PlatformDescriptions,
 } from "@/lib/clip-ranking";
 import {
   ensurePathForSubtitlesFilter,
@@ -18,7 +19,7 @@ import {
   getMediaDurationSeconds,
   runFfmpeg,
 } from "@/lib/ffmpeg";
-import { framesDir, jobsDir, outputDir, sourcesDir, tempDir, uploadDir } from "@/lib/paths";
+import { benchmarksDir, framesDir, jobsDir, outputDir, sourcesDir, tempDir, uploadDir } from "@/lib/paths";
 import {
   analyzeVideoVisually,
   buildVisualContextForPrompt,
@@ -31,6 +32,10 @@ import {
   DEFAULT_PRESET_ID,
   type CaptionPreset,
 } from "@/lib/caption-presets";
+import {
+  buildBenchmarkPromptContext,
+  type ViralBenchmark,
+} from "@/lib/tiktok-analytics";
 import OpenAI from "openai";
 import {
   canTranscribe,
@@ -71,6 +76,10 @@ export type ClipResult = {
   overallScore: number;
   rationale: string;
   title: string;
+  /** Short hook text overlay (2-5 words) */
+  hookText: string;
+  /** Platform-specific descriptions/captions */
+  descriptions: { tiktok: string; instagram: string; youtube: string };
   thumbnailUrl?: string;
   hookApplied?: boolean;
 };
@@ -106,6 +115,22 @@ export type JobManifest = {
 const clipVideoPreset = process.env.CLIP_VIDEO_PRESET ?? "medium";
 const clipVideoCrf = process.env.CLIP_VIDEO_CRF ?? "18";
 const clipAudioBitrate = process.env.CLIP_AUDIO_BITRATE ?? "192k";
+
+async function loadActiveBenchmarkContext(): Promise<string> {
+  try {
+    const raw = await fs.readFile(
+      path.join(benchmarksDir, "active-benchmark.json"),
+      "utf-8",
+    );
+    const data = JSON.parse(raw) as { benchmark?: ViralBenchmark };
+    if (data.benchmark && data.benchmark.totalAnalyzed > 0) {
+      return buildBenchmarkPromptContext(data.benchmark);
+    }
+  } catch {
+    // No benchmark saved — that's fine
+  }
+  return "";
+}
 
 function sanitizeName(value: string) {
   return value.replace(/[^a-zA-Z0-9-_]/g, "_");
@@ -341,36 +366,65 @@ export async function renderSingleClip(params: {
   splitScreen: boolean;
   srcWidth: number;
   srcHeight: number;
+  /** Hook text overlay (shown first 3s) */
+  hookText?: string;
+  /** Zoom timestamp relative to clip start (seconds) */
+  zoomAt?: number;
 }): Promise<void> {
   const { sourceVideoPath, outputPath, start, duration, title, watermark, subtitlePath, splitScreen } = params;
   const safeTitle = ensureTextForDrawText(title);
   const safeWatermark = ensureTextForDrawText(watermark);
 
-  const HEADER_H = 200;
-  const FOOTER_H = 180;
-  const VIDEO_H = 1920 - HEADER_H;
+  // ---------------------------------------------------------------------------
+  // Full 9:16 (1080x1920) — NO black bars. Video fills the entire frame.
+  // Title + watermark float as transparent overlays on top of the video.
+  // This matches the TikTok/Reels/Shorts standard used by top creators.
+  // ---------------------------------------------------------------------------
+
+  const OUT_W = 1080;
+  const OUT_H = 1920;
 
   const isLandscape = params.srcWidth > params.srcHeight && params.srcWidth > 0;
   const applySplit = splitScreen && isLandscape;
 
-  if (applySplit) {
-    const halfH = Math.floor(VIDEO_H / 2);
+  // Hook text overlay: big text shown in first 3 seconds
+  const hookTextFilter = params.hookText
+    ? `drawtext=text='${ensureTextForDrawText(params.hookText)}':font='Arial Black':fontcolor=yellow:fontsize=64:borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.35:enable='between(t,0.2,3.0)'`
+    : "";
 
-    const overlayFilters = [
-      `drawbox=x=0:y=h-${FOOTER_H}:w=iw:h=${FOOTER_H}:color=black@0.50:t=fill`,
-      `drawbox=x=0:y=${HEADER_H + halfH - 2}:w=iw:h=4:color=white@0.3:t=fill`,
-      `drawtext=text='${safeTitle}':font=Arial:fontcolor=white:fontsize=44:x=(w-text_w)/2:y=${Math.floor(HEADER_H / 2 - 22)}`,
-      `drawtext=text='${safeWatermark}':font=Arial:fontcolor=white@0.90:fontsize=34:x=(w-text_w)/2:y=h-th-55`,
-    ];
+  // Dynamic zoom at peak moment
+  const zoomFilter = params.zoomAt != null && params.zoomAt > 0
+    ? (() => {
+        const zoomStart = Math.max(0, params.zoomAt - 0.8);
+        const zoomEnd = params.zoomAt + 1.5;
+        return `zoompan=z='if(between(in_time,${zoomStart.toFixed(2)},${zoomEnd.toFixed(2)}),1.0+0.12*sin((in_time-${zoomStart.toFixed(2)})/${(zoomEnd - zoomStart).toFixed(2)}*PI),1.0)':d=1:s=${OUT_W}x${OUT_H}:fps=30`;
+      })()
+    : "";
+
+  // Overlay filters: only subtitles + hook text. No title/watermark bars.
+  function buildOverlayFilters(): string[] {
+    const f: string[] = [];
     if (subtitlePath) {
-      overlayFilters.push(`subtitles='${ensurePathForSubtitlesFilter(subtitlePath)}'`);
+      f.push(`subtitles='${ensurePathForSubtitlesFilter(subtitlePath)}'`);
     }
+    if (hookTextFilter) f.push(hookTextFilter);
+    return f;
+  }
 
+  if (applySplit) {
+    const halfH = Math.floor(OUT_H / 2);
+    const overlayFilters = buildOverlayFilters();
+    // Split-screen divider line
+    overlayFilters.push(
+      `drawbox=x=0:y=${halfH - 2}:w=iw:h=4:color=white@0.4:t=fill`,
+    );
+
+    const overlayChain = overlayFilters.length > 0 ? `,${overlayFilters.join(",")}` : "";
     const filterComplex = [
       `[0:v]split[a][b]`,
-      `[a]crop=iw/2:ih:0:0,scale=1080:${halfH}[left]`,
-      `[b]crop=iw/2:ih:iw/2:0,scale=1080:${halfH}[right]`,
-      `[left][right]vstack,pad=1080:1920:0:${HEADER_H}:black,${overlayFilters.join(",")}[out]`,
+      `[a]crop=iw/2:ih:0:0,scale=${OUT_W}:${halfH}[left]`,
+      `[b]crop=iw/2:ih:iw/2:0,scale=${OUT_W}:${halfH}[right]`,
+      `[left][right]vstack${overlayChain}[out]`,
     ].join(";");
 
     await runFfmpeg([
@@ -385,23 +439,21 @@ export async function renderSingleClip(params: {
       outputPath,
     ]);
   } else {
-    const filters: string[] = [
-      `drawbox=x=0:y=h-${FOOTER_H}:w=iw:h=${FOOTER_H}:color=black@0.50:t=fill`,
-    ];
-    if (subtitlePath) {
-      filters.push(`subtitles='${ensurePathForSubtitlesFilter(subtitlePath)}'`);
+    const filters = buildOverlayFilters();
+
+    // Scale to fill 1080x1920 (9:16) — crop to avoid black bars
+    let vf = zoomFilter
+      ? `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},${zoomFilter}`
+      : `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H}`;
+
+    if (filters.length > 0) {
+      vf += `,${filters.join(",")}`;
     }
-    filters.push(
-      `drawtext=text='${safeTitle}':font=Arial:fontcolor=white:fontsize=44:x=(w-text_w)/2:y=${Math.floor(HEADER_H / 2 - 22)}`,
-    );
-    filters.push(
-      `drawtext=text='${safeWatermark}':font=Arial:fontcolor=white@0.90:fontsize=34:x=(w-text_w)/2:y=h-th-55`,
-    );
 
     await runFfmpeg([
       "-y", "-ss", start.toFixed(2), "-t", duration.toFixed(2),
       "-i", sourceVideoPath,
-      "-vf", `scale=1080:${VIDEO_H}:force_original_aspect_ratio=increase,crop=1080:${VIDEO_H},pad=1080:1920:0:${HEADER_H}:black,${filters.join(",")}`,
+      "-vf", vf,
       "-c:v", "libx264", "-preset", clipVideoPreset, "-crf", clipVideoCrf,
       "-pix_fmt", "yuv420p",
       "-c:a", "aac", "-b:a", clipAudioBitrate,
@@ -701,11 +753,14 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
       await fs.rm(kf.path, { force: true }).catch(() => {});
     }
 
+    // Load TikTok benchmark data (if available) to calibrate clip detection
+    const benchmarkContext = await loadActiveBenchmarkContext();
+
     let moments: DetectedMoment[] = [];
     let usedLlmDetection = false;
 
     if (transcriptSegments.length > 0) {
-      // Try LLM-first moment detection (with visual context if available)
+      // Try LLM-first moment detection (with visual + benchmark context)
       const llmMoments = await detectMomentsWithLlm({
         segments: transcriptSegments,
         sceneChanges,
@@ -713,6 +768,7 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         videoDuration: duration,
         maxClips: input.clipCount,
         visualContext: visualContextStr || undefined,
+        benchmarkContext: benchmarkContext || undefined,
       });
 
       if (llmMoments && llmMoments.length > 0) {
@@ -738,6 +794,9 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         start,
         end: Math.min(start + defaultDuration, duration),
         title: fallbackTitle,
+        hookText: "",
+        zoomTimestamp: null,
+        descriptions: { tiktok: "", instagram: "", youtube: "" },
         scores: { hook: 0, flow: 0, engagement: 0, completeness: 0 },
         overallScore: 0,
         rationale: "Sin transcripcion — distribucion temporal uniforme.",
@@ -826,12 +885,19 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
 
       if (isKaraoke) karaokeCount++;
 
-      // Title priority: auto-generated > LLM moment title > manual fallback
-      const clipTitle = clipTitles[i] || moment.title || fallbackTitle;
+      // Title: when autoTitle is ON use LLM titles; when OFF use manual title only
+      const clipTitle = input.autoTitle
+        ? (clipTitles[i] || moment.title || fallbackTitle)
+        : fallbackTitle;
       const fileName = outputFileName(jobId, i);
       const finalPath = path.join(outputDir, fileName);
 
-      // Render the base clip
+      // Compute zoom position relative to clip start
+      const zoomAt = moment.zoomTimestamp != null
+        ? moment.zoomTimestamp - moment.start
+        : undefined;
+
+      // Render the base clip with hook text overlay and zoom
       await renderSingleClip({
         sourceVideoPath: uploadFilePath,
         outputPath: finalPath,
@@ -843,6 +909,8 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         splitScreen: applySplitScreen,
         srcWidth,
         srcHeight,
+        hookText: moment.hookText || undefined,
+        zoomAt,
       });
 
       // Hook optimizer: prepend the most impactful 2-3s as a "spoiler hook"
@@ -905,6 +973,8 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         overallScore: moment.overallScore,
         rationale: moment.rationale,
         title: clipTitle,
+        hookText: moment.hookText ?? "",
+        descriptions: moment.descriptions ?? { tiktok: "", instagram: "", youtube: "" },
         thumbnailUrl,
         hookApplied,
       });
@@ -949,6 +1019,9 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
       thumbnailCount > 0
         ? `Thumbnails generados: ${thumbnailCount}/${clipResults.length}.`
         : "Sin thumbnails generados.",
+      benchmarkContext
+        ? "Benchmark TikTok activo: scoring calibrado con datos reales."
+        : "Sin benchmark TikTok: scoring basado en criterios del LLM.",
       `Render: preset=${clipVideoPreset} crf=${clipVideoCrf} audio=${clipAudioBitrate}.`,
       sceneChanges.length > 0
         ? `Cambios de escena detectados: ${sceneChanges.length}.`
