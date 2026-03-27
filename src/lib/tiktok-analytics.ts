@@ -8,12 +8,12 @@
 // 4. Track your own published clips' performance over time
 //
 // Env vars:
-//   RAPIDAPI_KEY — your RapidAPI key
+//   RAPIDAPI_KEY or RAPIDAPI_KEY_TIKTOK — your RapidAPI key
 // ---------------------------------------------------------------------------
 
-const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY ?? "";
+import { hasRapidApiKey, rapidApiGetJson } from "@/lib/rapidapi-client";
+
 const API_HOST = "tiktok-scraper7.p.rapidapi.com";
-const API_BASE = `https://${API_HOST}`;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,37 +75,26 @@ export type ViralBenchmark = {
 // ---------------------------------------------------------------------------
 
 function canUseTikTok(): boolean {
-  return RAPIDAPI_KEY.length > 0;
+  return hasRapidApiKey(API_HOST);
 }
 
 async function tikTokFetch(endpoint: string, params: Record<string, string>): Promise<unknown> {
   if (!canUseTikTok()) {
-    throw new Error("RAPIDAPI_KEY no configurada.");
+    throw new Error("No hay clave RapidAPI disponible para TikTok.");
   }
 
-  const url = new URL(endpoint, API_BASE);
-  for (const [k, v] of Object.entries(params)) {
-    url.searchParams.set(k, v);
-  }
-
-  const res = await fetch(url.toString(), {
-    method: "GET",
-    headers: {
-      "X-RapidAPI-Key": RAPIDAPI_KEY,
-      "X-RapidAPI-Host": API_HOST,
-    },
+  const json = await rapidApiGetJson<{ code?: number; msg?: string; data?: unknown }>({
+    host: API_HOST,
+    endpoint,
+    params,
+    retries: 1,
   });
 
-  if (!res.ok) {
-    throw new Error(`TikTok API error: ${res.status} ${res.statusText}`);
-  }
-
-  const json = await res.json() as { code: number; msg: string; data: unknown };
   if (json.code !== 0) {
-    throw new Error(`TikTok API: ${json.msg}`);
+    throw new Error(`TikTok API: ${json.msg ?? "respuesta invalida"}`);
   }
 
-  return json.data;
+  return json.data ?? {};
 }
 
 // ---------------------------------------------------------------------------

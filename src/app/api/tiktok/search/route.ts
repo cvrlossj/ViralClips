@@ -12,7 +12,7 @@ export const dynamic = "force-dynamic";
 export async function POST(req: NextRequest) {
   if (!canUseTikTok()) {
     return NextResponse.json(
-      { error: "RAPIDAPI_KEY no configurada. Agrega RAPIDAPI_KEY a .env.local" },
+      { error: "No hay clave de RapidAPI para TikTok. Configura RAPIDAPI_KEY o RAPIDAPI_KEY_TIKTOK." },
       { status: 400 },
     );
   }
