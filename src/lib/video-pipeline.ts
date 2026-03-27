@@ -6,17 +6,20 @@ import {
   detectAdSegments,
   detectMomentsWithLlm,
   detectSceneChangeTimes,
+  evaluateMomentBeats,
+  refineMomentsWithNarrativeContext,
+  type BeatEvaluation,
   type ClipScores,
   type DetectedMoment,
-  type PlatformDescriptions,
 } from "@/lib/clip-ranking";
 import {
-  ensurePathForSubtitlesFilter,
+  detectActiveCropArea,
   ensureTextForDrawText,
   extractCompressedAudio,
   extractKeyframes,
   getMediaDimensions,
   getMediaDurationSeconds,
+  getMediaStreamInfo,
   runFfmpeg,
 } from "@/lib/ffmpeg";
 import { benchmarksDir, framesDir, jobsDir, outputDir, sourcesDir, storageRoot, tempDir, uploadDir } from "@/lib/paths";
@@ -26,42 +29,22 @@ import {
   type VisualAnalysisResult,
 } from "@/lib/visual-analysis";
 import {
-  getPreset,
-  wordsToPresetAss,
-  srtToPresetAss,
-  DEFAULT_PRESET_ID,
-  type CaptionPreset,
-} from "@/lib/caption-presets";
-import {
   buildBenchmarkPromptContext,
   type ViralBenchmark,
 } from "@/lib/tiktok-analytics";
-import OpenAI from "openai";
 import {
   canTranscribe,
-  transcribeToSrt,
   transcribeVerbose,
-  transcribeWords,
   type TranscriptWord,
 } from "@/lib/transcription";
-
-const titleClient = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  : null;
 
 type PipelineInput = {
   /** Path to the video file already saved on disk */
   filePath: string;
   /** Original file name (for extension detection) */
   fileName: string;
-  title: string;
-  watermark: string;
   clipCount: number;
-  subtitleSize: number;
   splitScreen: boolean;
-  autoTitle: boolean;
-  /** Caption preset ID (e.g. "hormozi", "mrbeast") */
-  captionPreset: string;
   /** Enable hook optimizer (spoiler hook at start) */
   hookOptimizer: boolean;
   /** Watermark image filename from storage/watermark/ (e.g. "marca_de_agua.png") or "none" */
@@ -84,6 +67,12 @@ export type ClipResult = {
   descriptions: { tiktok: string; instagram: string; youtube: string };
   thumbnailUrl?: string;
   hookApplied?: boolean;
+  variantUsed?: NarrativeVariantKind;
+  narrativeScore?: number;
+  beatSummary?: string;
+  qualityFlags?: string[];
+  qualityGateStatus?: "pass" | "review";
+  qualityGateScore?: number;
 };
 
 type PipelineResult = {
@@ -104,12 +93,10 @@ export type JobManifest = {
     signalCount: number;
   };
   settings: {
-    watermark: string;
-    subtitleSize: number;
     splitScreen: boolean;
-    captionPreset: string;
     hookOptimizer: boolean;
     watermarkImage: string;
+    sourceCropFilter?: string;
   };
   notes: string[];
   createdAt: string;
@@ -118,6 +105,14 @@ export type JobManifest = {
 const clipVideoPreset = process.env.CLIP_VIDEO_PRESET ?? "medium";
 const clipVideoCrf = process.env.CLIP_VIDEO_CRF ?? "18";
 const clipAudioBitrate = process.env.CLIP_AUDIO_BITRATE ?? "192k";
+
+function readDurationEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(raw)));
+}
+
+const MIN_FINAL_CLIP_DURATION_SEC = readDurationEnv("CLIP_MIN_DURATION_SECONDS", 36, 20, 120);
 
 async function loadActiveBenchmarkContext(): Promise<string> {
   try {
@@ -159,6 +154,251 @@ function buildStarts(duration: number, count: number, clipDuration: number) {
 
 function outputFileName(jobId: string, index: number) {
   return `${jobId}_clip_${String(index + 1).padStart(2, "0")}.mp4`;
+}
+
+function overlapSeconds(aStart: number, aEnd: number, bStart: number, bEnd: number) {
+  return Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function round2(value: number) {
+  return Number(value.toFixed(2));
+}
+
+function countNarrativeAdjustments(before: DetectedMoment[], after: DetectedMoment[]): number {
+  if (before.length === 0 || after.length === 0) return 0;
+
+  let adjusted = 0;
+
+  for (const refined of after) {
+    let best: DetectedMoment | null = null;
+    let bestOverlap = -1;
+
+    for (const original of before) {
+      const overlap = overlapSeconds(refined.start, refined.end, original.start, original.end);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = original;
+      }
+    }
+
+    if (!best) {
+      adjusted += 1;
+      continue;
+    }
+
+    const startDiff = Math.abs(best.start - refined.start);
+    const endDiff = Math.abs(best.end - refined.end);
+    if (startDiff >= 1 || endDiff >= 1) {
+      adjusted += 1;
+    }
+  }
+
+  return adjusted;
+}
+
+type NarrativeVariantKind = "safe" | "balanced" | "aggressive";
+
+type NarrativeVariantCandidate = {
+  kind: NarrativeVariantKind;
+  moment: DetectedMoment;
+  beat: BeatEvaluation;
+  narrativeScore: number;
+  engagementScore: number;
+  overallScore: number;
+  discardedByAntiFlat: boolean;
+  qualityGateStatus: "pass" | "review";
+  qualityGateScore: number;
+  qualityGateIssues: string[];
+};
+
+type SelectedMoment = {
+  moment: DetectedMoment;
+  variantUsed?: NarrativeVariantKind;
+  narrativeScore?: number;
+  beatSummary?: string;
+  qualityFlags?: string[];
+  qualityGateStatus?: "pass" | "review";
+  qualityGateScore?: number;
+};
+
+function mergeClipScores(base: ClipScores, beat: BeatEvaluation): ClipScores {
+  return {
+    hook: clamp(Math.round(base.hook * 0.35 + beat.hookScore * 0.65), 0, 100),
+    flow: clamp(Math.round(base.flow * 0.45 + beat.narrativeScore * 0.55), 0, 100),
+    engagement: clamp(Math.round(base.engagement * 0.4 + beat.engagementScore * 0.6), 0, 100),
+    completeness: clamp(Math.round(base.completeness * 0.25 + beat.completenessScore * 0.75), 0, 100),
+  };
+}
+
+function buildNarrativeVariantWindow(params: {
+  moment: DetectedMoment;
+  beat: BeatEvaluation;
+  kind: NarrativeVariantKind;
+  videoDuration: number;
+}) {
+  const { moment, beat, kind, videoDuration } = params;
+  const baseDuration = Math.max(moment.end - moment.start, MIN_FINAL_CLIP_DURATION_SEC);
+  const safeBoost = Math.max(6, Math.round(baseDuration * 0.15));
+  const aggressiveTrim = Math.max(4, Math.round(baseDuration * 0.08));
+
+  const duration = kind === "safe"
+    ? clamp(baseDuration + safeBoost, MIN_FINAL_CLIP_DURATION_SEC, 180)
+    : kind === "balanced"
+      ? clamp(baseDuration + (beat.completenessScore < 68 ? 4 : 0), MIN_FINAL_CLIP_DURATION_SEC, 180)
+      : clamp(baseDuration - aggressiveTrim, MIN_FINAL_CLIP_DURATION_SEC, 180);
+
+  const anchorFraction = kind === "safe"
+    ? 0.58
+    : kind === "balanced"
+      ? 0.5
+      : 0.42;
+
+  let start = beat.anchorTimestamp - duration * anchorFraction;
+  let end = start + duration;
+
+  if (start < 0) {
+    end -= start;
+    start = 0;
+  }
+
+  if (end > videoDuration) {
+    const delta = end - videoDuration;
+    start = Math.max(0, start - delta);
+    end = videoDuration;
+  }
+
+  if (end - start < MIN_FINAL_CLIP_DURATION_SEC) {
+    end = Math.min(videoDuration, start + MIN_FINAL_CLIP_DURATION_SEC);
+    start = Math.max(0, end - MIN_FINAL_CLIP_DURATION_SEC);
+  }
+
+  return {
+    start: round2(start),
+    end: round2(end),
+  };
+}
+
+function buildNarrativeVariantMoment(params: {
+  moment: DetectedMoment;
+  beat: BeatEvaluation;
+  kind: NarrativeVariantKind;
+  videoDuration: number;
+  words: TranscriptWord[];
+}): DetectedMoment {
+  const { moment, beat, kind, videoDuration, words } = params;
+  const rawWindow = buildNarrativeVariantWindow({ moment, beat, kind, videoDuration });
+  const snapped = words.length > 0
+    ? snapToSentenceBoundary(words, rawWindow.start, rawWindow.end)
+    : rawWindow;
+
+  let start = snapped.start;
+  let end = snapped.end;
+
+  if (end - start < MIN_FINAL_CLIP_DURATION_SEC) {
+    start = rawWindow.start;
+    end = rawWindow.end;
+  }
+
+  start = clamp(round2(start), 0, Math.max(0, videoDuration - MIN_FINAL_CLIP_DURATION_SEC));
+  end = clamp(round2(end), Math.min(videoDuration, start + MIN_FINAL_CLIP_DURATION_SEC), videoDuration);
+
+  if (end - start < MIN_FINAL_CLIP_DURATION_SEC) {
+    end = Math.min(videoDuration, start + MIN_FINAL_CLIP_DURATION_SEC);
+    start = Math.max(0, end - MIN_FINAL_CLIP_DURATION_SEC);
+  }
+
+  const zoomTimestamp = clamp(beat.anchorTimestamp, start, end);
+  const rationaleSuffix = `variante ${kind} · beats ${beat.summary}`;
+
+  return {
+    ...moment,
+    start,
+    end,
+    zoomTimestamp: round2(zoomTimestamp),
+    rationale: moment.rationale
+      ? `${moment.rationale} | ${rationaleSuffix}`
+      : rationaleSuffix,
+  };
+}
+
+function scoreNarrativeVariant(params: {
+  moment: DetectedMoment;
+  beat: BeatEvaluation;
+  kind: NarrativeVariantKind;
+}) {
+  const { moment, beat, kind } = params;
+  const narrativeScore = clamp(
+    Math.round(
+      beat.narrativeScore * 0.48 +
+      beat.completenessScore * 0.24 +
+      beat.beatCoverageScore * 0.16 +
+      moment.scores.flow * 0.12,
+    ),
+    0,
+    100,
+  );
+  const engagementScore = clamp(
+    Math.round(
+      beat.engagementScore * 0.58 +
+      beat.hookScore * 0.22 +
+      moment.scores.engagement * 0.20,
+    ),
+    0,
+    100,
+  );
+  const kindBias = kind === "safe" ? 1 : kind === "balanced" ? 0 : 2;
+  const flatPenalty = beat.flatRisk ? 18 : 0;
+  const overallScore = clamp(
+    Math.round(narrativeScore * 0.58 + engagementScore * 0.42 + kindBias - flatPenalty),
+    0,
+    100,
+  );
+
+  return { narrativeScore, engagementScore, overallScore };
+}
+
+function isAntiFlatBeat(evaluation: BeatEvaluation) {
+  return evaluation.flatRisk || (evaluation.hookScore < 35 && evaluation.completenessScore < 62);
+}
+
+function evaluateNarrativeQualityGate(params: {
+  beat: BeatEvaluation;
+  narrativeScore: number;
+  engagementScore: number;
+}): { status: "pass" | "review"; score: number; issues: string[] } {
+  const { beat, narrativeScore, engagementScore } = params;
+  const issues: string[] = [];
+
+  if (beat.hookScore < 38) issues.push("hook-bajo");
+  if (beat.completenessScore < 62) issues.push("completitud-baja");
+  if (beat.missingBeats.includes("payoff")) issues.push("sin-payoff");
+  if (beat.missingBeats.includes("reaction")) issues.push("sin-reaccion");
+  if (narrativeScore < 62) issues.push("narrativa-baja");
+  if (engagementScore < 58) issues.push("engagement-bajo");
+
+  const penalty = issues.length * 9;
+  const score = clamp(
+    Math.round(
+      beat.completenessScore * 0.34 +
+      narrativeScore * 0.32 +
+      engagementScore * 0.20 +
+      beat.hookScore * 0.14 -
+      penalty,
+    ),
+    0,
+    100,
+  );
+
+  const pass = score >= 60 && !issues.includes("sin-payoff") && !issues.includes("sin-reaccion");
+  return {
+    status: pass ? "pass" : "review",
+    score,
+    issues,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -236,125 +476,6 @@ function snapToSentenceBoundary(
 }
 
 // ---------------------------------------------------------------------------
-// ASS subtitle generation — now uses caption presets from caption-presets.ts
-// The old hardcoded ASS functions have been replaced by the preset system.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Auto-generated viral titles per clip
-// ---------------------------------------------------------------------------
-// Uses GPT-4o-mini to generate a short, engaging, click-worthy title based on
-// the transcript of each clip segment.
-// ---------------------------------------------------------------------------
-
-function extractClipTranscript(
-  words: TranscriptWord[],
-  start: number,
-  end: number,
-): string {
-  return words
-    .filter((w) => w.start >= start && w.end <= end)
-    .map((w) => w.word)
-    .join(" ")
-    .trim();
-}
-
-async function generateViralTitle(transcript: string): Promise<string> {
-  if (!titleClient || !transcript.trim()) return "";
-
-  try {
-    const response = await titleClient.chat.completions.create({
-      model: "gpt-4o",
-      temperature: 0.8,
-      max_tokens: 60,
-      messages: [
-        {
-          role: "system",
-          content: [
-            "Eres un experto en contenido viral para YouTube Shorts, TikTok e Instagram Reels.",
-            "Tu trabajo es crear titulos CORTOS (maximo 6-8 palabras) que:",
-            "- Generen curiosidad inmediata",
-            "- Hagan que el usuario NO pueda pasar el video",
-            "- Usen lenguaje directo y emocional",
-            "- NO usen emojis",
-            "- NO usen hashtags",
-            "- NO usen comillas",
-            "Responde SOLO con el titulo, nada mas.",
-          ].join(" "),
-        },
-        {
-          role: "user",
-          content: `Genera un titulo viral para este clip. Transcripcion:\n\n${transcript.slice(0, 500)}`,
-        },
-      ],
-    });
-
-    return (response.choices[0]?.message?.content ?? "").trim().slice(0, 80);
-  } catch {
-    return "";
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Clip audio transcription (runs in parallel across clips)
-// ---------------------------------------------------------------------------
-// Returns word-level timestamps when available (for karaoke), falls back to
-// SRT-based ASS when the API doesn't return words.
-// ---------------------------------------------------------------------------
-
-async function transcribeClipAudio(params: {
-  uploadFilePath: string;
-  jobId: string;
-  index: number;
-  start: number;
-  durationForClip: number;
-  subtitleFontSize: number;
-  captionPreset: CaptionPreset;
-}): Promise<{ hasSubtitles: boolean; subtitlePath: string; isKaraoke: boolean }> {
-  const { uploadFilePath, jobId, index, start, durationForClip, subtitleFontSize, captionPreset } = params;
-  const subtitlePath = path.join(tempDir, `${jobId}_clip_${index + 1}.ass`);
-
-  if (!canTranscribe()) return { hasSubtitles: false, subtitlePath, isKaraoke: false };
-
-  try {
-    const tempAudioPath = path.join(tempDir, `${jobId}_clip_${index + 1}.wav`);
-
-    await runFfmpeg([
-      "-y",
-      "-ss", start.toFixed(2),
-      "-t", durationForClip.toFixed(2),
-      "-i", uploadFilePath,
-      "-vn", "-ac", "1", "-ar", "16000",
-      "-c:a", "pcm_s16le",
-      tempAudioPath,
-    ]);
-
-    // Try word-level transcription first (karaoke with preset)
-    try {
-      const words = await transcribeWords(tempAudioPath);
-      if (words.length > 0) {
-        const ass = wordsToPresetAss(words, subtitleFontSize, captionPreset);
-        await fs.writeFile(subtitlePath, ass, "utf-8");
-        await fs.rm(tempAudioPath, { force: true });
-        return { hasSubtitles: true, subtitlePath, isKaraoke: true };
-      }
-    } catch {
-      // Word-level failed, fall back to SRT-based
-    }
-
-    // Fallback: SRT-based subtitles with preset
-    const srt = await transcribeToSrt(tempAudioPath);
-    const ass = srtToPresetAss(srt, subtitleFontSize, captionPreset);
-    await fs.writeFile(subtitlePath, ass, "utf-8");
-    await fs.rm(tempAudioPath, { force: true });
-
-    return { hasSubtitles: true, subtitlePath, isKaraoke: false };
-  } catch {
-    return { hasSubtitles: false, subtitlePath, isKaraoke: false };
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Single clip renderer — used by both the main pipeline and re-render API
 // ---------------------------------------------------------------------------
 
@@ -380,9 +501,6 @@ export async function renderSingleClip(params: {
   outputPath: string;
   start: number;
   duration: number;
-  title: string;
-  watermark: string;
-  subtitlePath: string | null;
   splitScreen: boolean;
   srcWidth: number;
   srcHeight: number;
@@ -392,8 +510,10 @@ export async function renderSingleClip(params: {
   zoomAt?: number;
   /** Absolute path to watermark PNG (or null to skip) */
   watermarkPath?: string | null;
+  /** Pre-crop filter to remove baked black bars before the rest of the pipeline */
+  sourceCropFilter?: string | null;
 }): Promise<void> {
-  const { sourceVideoPath, outputPath, start, duration, subtitlePath, splitScreen } = params;
+  const { sourceVideoPath, outputPath, start, duration, splitScreen } = params;
 
   // ---------------------------------------------------------------------------
   // Full 9:16 (1080x1920) — NO black bars. Video fills the entire frame.
@@ -435,22 +555,23 @@ export async function renderSingleClip(params: {
   // asetrate changes sample rate interpretation → pitch up, then aresample restores correct rate
   const audioFilter = "asetrate=44100*1.02,aresample=44100";
 
-  // Build overlay filters (subtitles + hook text + color shift)
+  // Build overlay filters (hook text + color shift)
   function buildOverlayFilters(): string[] {
     const f: string[] = [];
     f.push(colorShiftFilter);
-    if (subtitlePath) {
-      f.push(`subtitles='${ensurePathForSubtitlesFilter(subtitlePath)}'`);
-    }
     if (hookTextFilter) f.push(hookTextFilter);
     return f;
   }
 
+  const sourceCropPrefix = params.sourceCropFilter ? `${params.sourceCropFilter},` : "";
+
   if (applySplit) {
     const halfH = Math.floor(OUT_H / 2);
+    const splitCropWidthExpr = "trunc(ih*9/8)";
     const overlayFilters = buildOverlayFilters();
     overlayFilters.push(
       `drawbox=x=0:y=${halfH - 2}:w=iw:h=4:color=white@0.4:t=fill`,
+      "setsar=1",
     );
 
     const overlayChain = overlayFilters.length > 0 ? `,${overlayFilters.join(",")}` : "";
@@ -461,24 +582,30 @@ export async function renderSingleClip(params: {
       "-i", sourceVideoPath,
     ];
 
+    const splitSourceLabel = params.sourceCropFilter ? "[prep]" : "[0:v]";
+
     let filterComplex: string;
     if (hasWatermark) {
       inputs.push("-i", watermarkPath!);
-      filterComplex = [
-        `[0:v]split[a][b]`,
-        `[a]crop=iw/2:ih:0:0,scale=${OUT_W}:${halfH}[left]`,
-        `[b]crop=iw/2:ih:iw/2:0,scale=${OUT_W}:${halfH}[right]`,
+      const parts = [
+        ...(params.sourceCropFilter ? [`[0:v]${params.sourceCropFilter}[prep]`] : []),
+        `${splitSourceLabel}split[a][b]`,
+        `[a]crop=${splitCropWidthExpr}:ih:0:0,scale=${OUT_W}:${halfH}:flags=lanczos,setsar=1[left]`,
+        `[b]crop=${splitCropWidthExpr}:ih:iw-${splitCropWidthExpr}:0,scale=${OUT_W}:${halfH}:flags=lanczos,setsar=1[right]`,
         `[left][right]vstack${overlayChain}[stacked]`,
         `[1:v]scale=160:-1,format=rgba,colorchannelmixer=aa=0.7[wm]`,
         `[stacked][wm]overlay=W-w-30:H-h-30[out]`,
-      ].join(";");
+      ];
+      filterComplex = parts.join(";");
     } else {
-      filterComplex = [
-        `[0:v]split[a][b]`,
-        `[a]crop=iw/2:ih:0:0,scale=${OUT_W}:${halfH}[left]`,
-        `[b]crop=iw/2:ih:iw/2:0,scale=${OUT_W}:${halfH}[right]`,
+      const parts = [
+        ...(params.sourceCropFilter ? [`[0:v]${params.sourceCropFilter}[prep]`] : []),
+        `${splitSourceLabel}split[a][b]`,
+        `[a]crop=${splitCropWidthExpr}:ih:0:0,scale=${OUT_W}:${halfH}:flags=lanczos,setsar=1[left]`,
+        `[b]crop=${splitCropWidthExpr}:ih:iw-${splitCropWidthExpr}:0,scale=${OUT_W}:${halfH}:flags=lanczos,setsar=1[right]`,
         `[left][right]vstack${overlayChain}[out]`,
-      ].join(";");
+      ];
+      filterComplex = parts.join(";");
     }
 
     await runFfmpeg([
@@ -497,8 +624,8 @@ export async function renderSingleClip(params: {
 
     // Scale to fill 1080x1920 (9:16) — crop to avoid black bars
     const scaleChain = zoomFilter
-      ? `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},${zoomFilter}`
-      : `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H}`;
+      ? `${sourceCropPrefix}scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},setsar=1,${zoomFilter}`
+      : `${sourceCropPrefix}scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},setsar=1`;
 
     const inputs = [
       "-y", "-ss", start.toFixed(2), "-t", duration.toFixed(2),
@@ -724,9 +851,9 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
     const duration = await getMediaDurationSeconds(uploadFilePath);
     const diagnostics: string[] = [];
 
-    const fallbackTitle = input.title.trim() || "Clip viral";
+    const fallbackTitle = "Clip viral";
 
-    // Full-video word timestamps for karaoke subtitles
+    // Full-video word timestamps for sentence snapping and hook analysis
     let fullVideoWords: TranscriptWord[] = [];
 
     // Detect video dimensions — auto split-screen for landscape videos
@@ -739,10 +866,22 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
     } catch {
       diagnostics.push("No se pudieron leer las dimensiones del video.");
     }
-    const isLandscape = srcWidth > srcHeight && srcWidth > 0;
-    // Auto split-screen: apply when video is landscape (16:9, podcast, etc.)
-    // Users can force it off via the splitScreen toggle
-    const applySplitScreen = isLandscape && (input.splitScreen !== false);
+    const aspectRatio = srcHeight > 0 ? srcWidth / srcHeight : 0;
+    // Auto split-screen only on clearly wide sources to avoid awkward crops.
+    const applySplitScreen = input.splitScreen && aspectRatio >= 1.5 && srcWidth >= 1280;
+
+    let sourceCropFilter: string | null = null;
+    try {
+      const crop = await detectActiveCropArea({ filePath: uploadFilePath });
+      if (crop) {
+        sourceCropFilter = crop.filter;
+        diagnostics.push(
+          `Auto-crop activo detectado: ${crop.width}x${crop.height}+${crop.x}+${crop.y}.`,
+        );
+      }
+    } catch {
+      diagnostics.push("No se pudo analizar auto-crop del video fuente.");
+    }
 
     // Extract compressed audio once — used for full-video transcription
     let fullAudioExtracted = false;
@@ -841,6 +980,7 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
 
     let moments: DetectedMoment[] = [];
     let usedLlmDetection = false;
+    let narrativeAdjustedCount = 0;
 
     if (transcriptSegments.length > 0) {
       // Try LLM-first moment detection (with visual + benchmark context)
@@ -871,7 +1011,7 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
 
     // If no moments detected (no transcript), fall back to uniform distribution
     if (moments.length === 0) {
-      const defaultDuration = 30;
+      const defaultDuration = Math.max(MIN_FINAL_CLIP_DURATION_SEC, 36);
       const starts = buildStarts(duration, input.clipCount, defaultDuration);
       moments = starts.map((start) => ({
         start,
@@ -887,94 +1027,223 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
       }));
     }
 
+    // Narrative refinement pass:
+    // expands setup + reaction around the peak moment to avoid abrupt cuts.
+    if (moments.length > 0 && transcriptSegments.length > 0) {
+      const beforeRefine = [...moments];
+      moments = refineMomentsWithNarrativeContext({
+        moments,
+        segments: transcriptSegments,
+        adSegments,
+        sceneChanges,
+        videoDuration: duration,
+        maxClips: input.clipCount,
+      });
+      narrativeAdjustedCount = countNarrativeAdjustments(beforeRefine, moments);
+    }
+
     // Apply sentence-boundary snapping to LLM moments
     if (fullVideoWords.length > 0) {
       moments = moments.map((m) => {
         const snapped = snapToSentenceBoundary(fullVideoWords, m.start, m.end);
         // Only apply if the snapped range is still reasonable
         const snappedDuration = snapped.end - snapped.start;
-        if (snappedDuration >= 10 && snappedDuration <= 180) {
+        if (snappedDuration >= MIN_FINAL_CLIP_DURATION_SEC && snappedDuration <= 180) {
           return { ...m, start: snapped.start, end: snapped.end };
         }
         return m;
       });
     }
 
+    let variantReplacedCount = 0;
+    let antiFlatDiscardCount = 0;
+    let antiFlatFallbackCount = 0;
+    let qualityGateFallbackCount = 0;
+    let selectedMoments: SelectedMoment[] = moments.map((moment) => ({ moment }));
+
+    if (transcriptSegments.length > 0 && moments.length > 0) {
+      const variantKinds: NarrativeVariantKind[] = ["safe", "balanced", "aggressive"];
+      const variantSelected: SelectedMoment[] = [];
+
+      for (const baseMoment of moments) {
+        const baseBeat = evaluateMomentBeats({
+          moment: baseMoment,
+          segments: transcriptSegments,
+          sceneChanges,
+        });
+
+        const candidates: NarrativeVariantCandidate[] = variantKinds.map((kind) => {
+          const variantMoment = buildNarrativeVariantMoment({
+            moment: baseMoment,
+            beat: baseBeat,
+            kind,
+            videoDuration: duration,
+            words: fullVideoWords,
+          });
+          const variantBeat = evaluateMomentBeats({
+            moment: variantMoment,
+            segments: transcriptSegments,
+            sceneChanges,
+          });
+          const variantScores = scoreNarrativeVariant({
+            moment: variantMoment,
+            beat: variantBeat,
+            kind,
+          });
+          const qualityGate = evaluateNarrativeQualityGate({
+            beat: variantBeat,
+            narrativeScore: variantScores.narrativeScore,
+            engagementScore: variantScores.engagementScore,
+          });
+
+          return {
+            kind,
+            moment: {
+              ...variantMoment,
+              scores: mergeClipScores(variantMoment.scores, variantBeat),
+              overallScore: variantScores.overallScore,
+            },
+            beat: variantBeat,
+            narrativeScore: variantScores.narrativeScore,
+            engagementScore: variantScores.engagementScore,
+            overallScore: variantScores.overallScore,
+            discardedByAntiFlat: isAntiFlatBeat(variantBeat),
+            qualityGateStatus: qualityGate.status,
+            qualityGateScore: qualityGate.score,
+            qualityGateIssues: qualityGate.issues,
+          };
+        });
+
+        const viableCandidates = candidates.filter((candidate) => !candidate.discardedByAntiFlat);
+        antiFlatDiscardCount += candidates.length - viableCandidates.length;
+        const gateCandidates = viableCandidates.filter((candidate) => candidate.qualityGateStatus === "pass");
+        if (viableCandidates.length > 0 && gateCandidates.length === 0) {
+          qualityGateFallbackCount += 1;
+        }
+        const candidatePool =
+          gateCandidates.length > 0
+            ? gateCandidates
+            : viableCandidates.length > 0
+              ? viableCandidates
+              : candidates;
+        if (viableCandidates.length === 0) {
+          antiFlatFallbackCount += 1;
+        }
+
+        const selected = candidatePool.reduce((best, candidate) => {
+          if (candidate.overallScore !== best.overallScore) {
+            return candidate.overallScore > best.overallScore ? candidate : best;
+          }
+          if (candidate.narrativeScore !== best.narrativeScore) {
+            return candidate.narrativeScore > best.narrativeScore ? candidate : best;
+          }
+          if (candidate.engagementScore !== best.engagementScore) {
+            return candidate.engagementScore > best.engagementScore ? candidate : best;
+          }
+          const order: Record<NarrativeVariantKind, number> = {
+            safe: 0,
+            balanced: 1,
+            aggressive: 2,
+          };
+          return order[candidate.kind] < order[best.kind] ? candidate : best;
+        });
+
+        const changedWindow =
+          Math.abs(selected.moment.start - baseMoment.start) > 0.25 ||
+          Math.abs(selected.moment.end - baseMoment.end) > 0.25;
+        if (selected.kind !== "balanced" || changedWindow) {
+          variantReplacedCount += 1;
+        }
+
+        const qualityFlags: string[] = [];
+        if (selected.discardedByAntiFlat) {
+          qualityFlags.push("anti-flat:fallback");
+        }
+        if (selected.qualityGateStatus !== "pass") {
+          qualityFlags.push("quality-gate:review");
+        } else {
+          qualityFlags.push("quality-gate:pass");
+        }
+        if (selected.qualityGateIssues.length > 0) {
+          qualityFlags.push(...selected.qualityGateIssues.slice(0, 2));
+        }
+        if (selected.beat.missingBeats.includes("payoff")) {
+          qualityFlags.push("sin-payoff-claro");
+        }
+        if (selected.beat.hookScore < 45) {
+          qualityFlags.push("hook-inicial-debil");
+        }
+        if (selected.beat.completenessScore < 60) {
+          qualityFlags.push("completitud-media");
+        }
+
+        variantSelected.push({
+          moment: selected.moment,
+          variantUsed: selected.kind,
+          narrativeScore: selected.narrativeScore,
+          beatSummary: selected.beat.summary,
+          qualityFlags: qualityFlags.length > 0 ? qualityFlags : undefined,
+          qualityGateStatus: selected.qualityGateStatus,
+          qualityGateScore: selected.qualityGateScore,
+        });
+      }
+
+      selectedMoments = variantSelected;
+    }
+
+    selectedMoments = selectedMoments.map((selection) => {
+      const moment = selection.moment;
+      if (moment.end - moment.start < MIN_FINAL_CLIP_DURATION_SEC) {
+        const end = Math.min(duration, moment.start + MIN_FINAL_CLIP_DURATION_SEC);
+        const start = Math.max(0, end - MIN_FINAL_CLIP_DURATION_SEC);
+        return {
+          ...selection,
+          moment: { ...moment, start: round2(start), end: round2(end) },
+        };
+      }
+      return selection;
+    });
+
+    moments = selectedMoments.map((selection) => selection.moment);
+
     // Sort moments by score (best first for display), then process
-    moments.sort((a, b) => b.overallScore - a.overallScore);
+    selectedMoments.sort((a, b) => b.moment.overallScore - a.moment.overallScore);
+    moments = selectedMoments.map((selection) => selection.moment);
 
-    const fontSize = Math.max(24, Math.min(56, input.subtitleSize));
-    const captionPreset = getPreset(input.captionPreset || DEFAULT_PRESET_ID);
-
-    const clipsData = moments.map((m, i) => ({
-      moment: m,
-      durationForClip: Number((m.end - m.start).toFixed(2)),
+    const clipsData = selectedMoments.map((selection, i) => ({
+      moment: selection.moment,
+      variantUsed: selection.variantUsed,
+      narrativeScore: selection.narrativeScore,
+      beatSummary: selection.beatSummary,
+      qualityFlags: selection.qualityFlags,
+      qualityGateStatus: selection.qualityGateStatus,
+      qualityGateScore: selection.qualityGateScore,
+      durationForClip: Number((selection.moment.end - selection.moment.start).toFixed(2)),
       index: i,
     }));
 
-    // Phase 2: Transcribe ALL clips in parallel (I/O-bound API calls)
-    const transcriptionResults = await Promise.allSettled(
-      clipsData.map(({ moment, durationForClip, index }) =>
-        transcribeClipAudio({
-          uploadFilePath,
-          jobId,
-          index,
-          start: moment.start,
-          durationForClip,
-          subtitleFontSize: fontSize,
-          captionPreset,
-        }),
-      ),
-    );
-
-    // Phase 2.5: Generate viral titles if LLM didn't provide them, or if autoTitle is on
-    let clipTitles: string[] = [];
-    if (input.autoTitle && fullVideoWords.length > 0 && titleClient) {
-      // Only generate titles for clips that don't already have LLM-generated ones
-      const titlePromises = clipsData.map(({ moment }) => {
-        if (usedLlmDetection && moment.title && moment.title !== "Clip viral") {
-          return Promise.resolve(moment.title);
-        }
-        const transcript = extractClipTranscript(
-          fullVideoWords,
-          moment.start,
-          moment.end,
-        );
-        return generateViralTitle(transcript);
-      });
-      const titleResults = await Promise.allSettled(titlePromises);
-      clipTitles = titleResults.map((r) =>
-        r.status === "fulfilled" && r.value ? r.value : "",
-      );
-    }
-
-    // Phase 3: Render clips sequentially (CPU-bound FFmpeg encoding)
+    // Phase 2: Render clips sequentially (CPU-bound FFmpeg encoding)
     // Resolve watermark image path once (used for all clips)
     const resolvedWatermarkPath = await resolveWatermarkPath(input.watermarkImage);
 
     const clipResults: ClipResult[] = [];
-    let karaokeCount = 0;
     let hookCount = 0;
     let thumbnailCount = 0;
+    let qualityGatePassCount = 0;
+    let qualityGateReviewCount = 0;
 
     for (let i = 0; i < clipsData.length; i += 1) {
-      const { moment, durationForClip } = clipsData[i];
-      const txResult = transcriptionResults[i];
-      const { hasSubtitles, subtitlePath, isKaraoke } =
-        txResult.status === "fulfilled"
-          ? txResult.value
-          : {
-              hasSubtitles: false,
-              subtitlePath: path.join(tempDir, `${jobId}_clip_${i + 1}.ass`),
-              isKaraoke: false,
-            };
-
-      if (isKaraoke) karaokeCount++;
-
-      // Title: when autoTitle is ON use LLM titles; when OFF use manual title only
-      const clipTitle = input.autoTitle
-        ? (clipTitles[i] || moment.title || fallbackTitle)
-        : fallbackTitle;
+      const {
+        moment,
+        durationForClip,
+        variantUsed,
+        narrativeScore,
+        beatSummary,
+        qualityFlags,
+        qualityGateStatus,
+        qualityGateScore,
+      } = clipsData[i];
+      const clipTitle = moment.title || fallbackTitle;
       const fileName = outputFileName(jobId, i);
       const finalPath = path.join(outputDir, fileName);
 
@@ -989,15 +1258,13 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         outputPath: finalPath,
         start: moment.start,
         duration: durationForClip,
-        title: clipTitle,
-        watermark: input.watermark.trim() || "@viralclips",
-        subtitlePath: hasSubtitles ? subtitlePath : null,
         splitScreen: applySplitScreen,
         srcWidth,
         srcHeight,
         hookText: moment.hookText || undefined,
         zoomAt,
         watermarkPath: resolvedWatermarkPath,
+        sourceCropFilter,
       });
 
       // Hook optimizer: prepend the most impactful 2-3s as a "spoiler hook"
@@ -1046,8 +1313,39 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         // Thumbnail extraction failed, not critical
       }
 
-      if (hasSubtitles) {
-        await fs.rm(subtitlePath, { force: true });
+      let finalGateStatus: "pass" | "review" = qualityGateStatus ?? "review";
+      let finalGateScore = qualityGateScore ?? 0;
+      const finalQualityFlags = [...(qualityFlags ?? [])];
+      try {
+        const streamInfo = await getMediaStreamInfo(finalPath);
+        const technicalIssues: string[] = [];
+
+        if (streamInfo.width !== 1080 || streamInfo.height !== 1920) {
+          technicalIssues.push(`formato-${streamInfo.width}x${streamInfo.height}`);
+        }
+        if (streamInfo.duration < MIN_FINAL_CLIP_DURATION_SEC - 1) {
+          technicalIssues.push(`duracion-corta-${streamInfo.duration.toFixed(1)}s`);
+        }
+        if (!streamInfo.hasAudio) {
+          technicalIssues.push("sin-audio");
+        }
+
+        if (technicalIssues.length > 0) {
+          finalGateStatus = "review";
+          finalGateScore = clamp(finalGateScore - technicalIssues.length * 10, 0, 100);
+          finalQualityFlags.push(...technicalIssues.slice(0, 2));
+        } else {
+          finalGateScore = clamp(finalGateScore + 6, 0, 100);
+        }
+      } catch {
+        finalGateStatus = "review";
+        finalQualityFlags.push("verificacion-tecnica-fallo");
+      }
+
+      if (finalGateStatus === "pass") {
+        qualityGatePassCount += 1;
+      } else {
+        qualityGateReviewCount += 1;
       }
 
       clipResults.push({
@@ -1055,7 +1353,7 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         url: `/api/download/${encodeURIComponent(fileName)}`,
         startSeconds: moment.start,
         durationSeconds: durationForClip,
-        hasSubtitles,
+        hasSubtitles: false,
         scores: moment.scores,
         overallScore: moment.overallScore,
         rationale: moment.rationale,
@@ -1064,10 +1362,14 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
         descriptions: moment.descriptions ?? { tiktok: "", instagram: "", youtube: "" },
         thumbnailUrl,
         hookApplied,
+        variantUsed,
+        narrativeScore,
+        beatSummary,
+        qualityFlags: finalQualityFlags.length > 0 ? finalQualityFlags : undefined,
+        qualityGateStatus: finalGateStatus,
+        qualityGateScore: finalGateScore,
       });
     }
-
-    const subtitleCount = clipResults.filter((c) => c.hasSubtitles).length;
 
     // Preserve source video for the editor
     const safeJobId = sanitizeName(jobId);
@@ -1077,14 +1379,8 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
     });
 
     const notes = [
-      canTranscribe()
-        ? subtitleCount > 0
-          ? `Subtitulos generados con OpenAI en ${subtitleCount}/${clipResults.length} clips.`
-          : "OpenAI disponible pero sin subtitulos generados en este lote."
-        : "Sin OPENAI_API_KEY: clips generados con titulo y marca de agua.",
-      karaokeCount > 0
-        ? `Subtitulos karaoke (word-by-word) en ${karaokeCount}/${subtitleCount} clips.`
-        : "Subtitulos karaoke no disponibles (sin timestamps de palabra).",
+      "Overlay de subtitulos y titulo desactivado para edicion externa (CapCut).",
+      `Duracion minima objetivo por clip: ${MIN_FINAL_CLIP_DURATION_SEC}s (si el metraje lo permite).`,
       usedLlmDetection
         ? visualAnalysis
           ? `Deteccion multimodal (audio + vision): GPT-4o analizo transcripcion + ${visualAnalysis.signals.length} frames visuales para identificar ${moments.length} momentos.`
@@ -1095,9 +1391,26 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
       applySplitScreen
         ? `Split-screen activado (${srcWidth}x${srcHeight}).`
         : input.splitScreen
-          ? "Split-screen solicitado pero el video no es landscape."
+          ? "Split-screen solicitado pero el video no cumple ratio/resolucion minima."
           : "Split-screen desactivado.",
-      `Caption preset: ${captionPreset.name}.`,
+      sourceCropFilter
+        ? "Auto-crop activo para eliminar franjas negras del video fuente."
+        : "Auto-crop no necesario o no detectado.",
+      narrativeAdjustedCount > 0
+        ? `Refinado narrativo aplicado en ${narrativeAdjustedCount}/${moments.length} clips (setup + payoff + reaccion).`
+        : transcriptSegments.length > 0
+          ? "Refinado narrativo activo: no fue necesario ajustar cortes en esta corrida."
+          : "Refinado narrativo omitido por falta de transcripcion.",
+      transcriptSegments.length > 0
+        ? `Variantes narrativas: ${variantReplacedCount}/${moments.length} clips reemplazados por safe/balanced/aggressive.`
+        : "Variantes narrativas omitidas por falta de transcripcion.",
+      transcriptSegments.length > 0
+        ? `Filtro anti-plano: descarto ${antiFlatDiscardCount} variantes${antiFlatFallbackCount > 0 ? ` y activo fallback en ${antiFlatFallbackCount} momentos.` : "."}`
+        : "Filtro anti-plano omitido por falta de transcripcion.",
+      `Quality Gate: ${qualityGatePassCount}/${clipResults.length} clips en PASS; ${qualityGateReviewCount} en REVIEW.`,
+      transcriptSegments.length > 0 && qualityGateFallbackCount > 0
+        ? `Quality Gate narrativo activo fallback en ${qualityGateFallbackCount} momentos (sin variante que cumpla todo).`
+        : "Quality Gate narrativo aplicado sin fallback.",
       hookCount > 0
         ? `Hook optimizer aplicado en ${hookCount}/${clipResults.length} clips.`
         : input.hookOptimizer
@@ -1133,12 +1446,10 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
           }
         : undefined,
       settings: {
-        watermark: input.watermark.trim() || "@viralclips",
-        subtitleSize: fontSize,
         splitScreen: applySplitScreen,
-        captionPreset: captionPreset.id,
         hookOptimizer: input.hookOptimizer,
         watermarkImage: input.watermarkImage || "none",
+        sourceCropFilter: sourceCropFilter ?? undefined,
       },
       notes,
       createdAt: new Date().toISOString(),
