@@ -15,16 +15,12 @@ import {
   RotateCcw,
   Scissors,
   Share2,
-  Type,
-  Subtitles,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardHeader,
-  CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -71,11 +67,10 @@ type JobManifest = {
     signalCount: number;
   };
   settings: {
-    watermark: string;
-    subtitleSize: number;
     splitScreen: boolean;
-    captionPreset?: string;
     hookOptimizer?: boolean;
+    watermarkImage?: string;
+    sourceCropFilter?: string;
   };
   notes: string[];
   createdAt: string;
@@ -89,16 +84,6 @@ function formatTime(s: number) {
   const m = Math.floor(s / 60);
   const sec = Math.floor(s % 60);
   return `${m}:${String(sec).padStart(2, "0")}`;
-}
-
-function sourceFileName(manifest: JobManifest) {
-  const ext =
-    manifest.sourceFileName
-      .split(".")
-      .pop()
-      ?.toLowerCase()
-      .replace(/[^a-z0-9]/g, "") || "mp4";
-  return `${manifest.jobId}.${ext}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,10 +114,8 @@ function EditorContent() {
   const [activeClipIdx, setActiveClipIdx] = useState(0);
 
   // Edit state
-  const [editTitle, setEditTitle] = useState("");
   const [editStart, setEditStart] = useState(0);
   const [editDuration, setEditDuration] = useState(0);
-  const [editWatermark, setEditWatermark] = useState("");
 
   // Playback
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -142,6 +125,17 @@ function EditorContent() {
   // Rerender
   const [rerendering, setRerendering] = useState(false);
   const [rerenderMsg, setRerenderMsg] = useState("");
+
+  // ---------------------------------------------------------------------------
+  // Sync edit fields when clip changes
+  // ---------------------------------------------------------------------------
+
+  const syncEditState = useCallback((m: JobManifest, idx: number) => {
+    const clip = m.clips[idx];
+    if (!clip) return;
+    setEditStart(clip.startSeconds);
+    setEditDuration(clip.durationSeconds);
+  }, []);
 
   // ---------------------------------------------------------------------------
   // Load manifest
@@ -167,20 +161,7 @@ function EditorContent() {
       })
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
-  }, [jobId]);
-
-  // ---------------------------------------------------------------------------
-  // Sync edit fields when clip changes
-  // ---------------------------------------------------------------------------
-
-  const syncEditState = useCallback((m: JobManifest, idx: number) => {
-    const clip = m.clips[idx];
-    if (!clip) return;
-    setEditTitle(clip.title);
-    setEditStart(clip.startSeconds);
-    setEditDuration(clip.durationSeconds);
-    setEditWatermark(m.settings.watermark);
-  }, []);
+  }, [jobId, syncEditState]);
 
   const selectClip = useCallback(
     (idx: number) => {
@@ -238,10 +219,8 @@ function EditorContent() {
         body: JSON.stringify({
           jobId: manifest.jobId,
           clipIndex: activeClipIdx,
-          title: editTitle,
           start: editStart,
           duration: editDuration,
-          watermark: editWatermark,
         }),
       });
 
@@ -283,19 +262,8 @@ function EditorContent() {
   const hasChanges =
     manifest &&
     activeClip &&
-    (editTitle !== activeClip.title ||
-      editStart !== activeClip.startSeconds ||
-      editDuration !== activeClip.durationSeconds ||
-      editWatermark !== manifest.settings.watermark);
-
-  // Words for the active clip time range (for subtitle preview)
-  const clipWords =
-    manifest && activeClip
-      ? manifest.words.filter(
-          (w) =>
-            w.start >= editStart && w.end <= editStart + editDuration,
-        )
-      : [];
+    (editStart !== activeClip.startSeconds ||
+      editDuration !== activeClip.durationSeconds);
 
   // ---------------------------------------------------------------------------
   // Render
@@ -405,17 +373,9 @@ function EditorContent() {
                     {clip.overallScore}
                   </Badge>
                 )}
-                {clip.hasSubtitles && (
-                  <Badge
-                    variant="outline"
-                    className="text-[10px] px-1.5 py-0 border-(--accent-2)/40 text-(--accent-2)"
-                  >
-                    SUB
-                  </Badge>
-                )}
               </div>
               <p className="mt-1 text-xs truncate max-w-[140px]">
-                {clip.title}
+                Clip #{idx + 1}
               </p>
               <p className="text-[10px] text-(--muted-fg) mt-0.5">
                 {formatTime(clip.startSeconds)} — {formatTime(clip.startSeconds + clip.durationSeconds)}
@@ -511,7 +471,7 @@ function EditorContent() {
               <video
                 ref={videoRef}
                 key={`${activeClip.fileName}-${activeClip.startSeconds}`}
-                className="h-full w-full object-contain"
+                className="h-full w-full object-cover"
                 src={clipVideoUrl}
                 playsInline
               />
@@ -630,46 +590,15 @@ function EditorContent() {
           )}
 
           {/* Edit tabs */}
-          <Tabs defaultValue="title" className="px-5 py-4">
+          <Tabs defaultValue="trim" className="px-5 py-4">
             <TabsList className="w-full bg-(--surface-2)">
-              <TabsTrigger value="title" className="flex-1 text-xs">
-                <Type className="mr-1 h-3.5 w-3.5" /> Titulo
-              </TabsTrigger>
               <TabsTrigger value="trim" className="flex-1 text-xs">
                 <Scissors className="mr-1 h-3.5 w-3.5" /> Trim
-              </TabsTrigger>
-              <TabsTrigger value="subs" className="flex-1 text-xs">
-                <Subtitles className="mr-1 h-3.5 w-3.5" /> Subs
               </TabsTrigger>
               <TabsTrigger value="copys" className="flex-1 text-xs">
                 <Share2 className="mr-1 h-3.5 w-3.5" /> Copys
               </TabsTrigger>
             </TabsList>
-
-            {/* Tab: Title */}
-            <TabsContent value="title" className="mt-4 space-y-4">
-              <div>
-                <Label className="text-xs text-(--muted-fg)">Titulo del clip</Label>
-                <Input
-                  className="mt-1 bg-(--surface-2) border-(--line)"
-                  value={editTitle}
-                  onChange={(e) => setEditTitle(e.target.value)}
-                  maxLength={80}
-                />
-                <p className="mt-1 text-[10px] text-(--muted-fg)">
-                  {editTitle.length}/80 caracteres
-                </p>
-              </div>
-              <div>
-                <Label className="text-xs text-(--muted-fg)">Marca de agua</Label>
-                <Input
-                  className="mt-1 bg-(--surface-2) border-(--line)"
-                  value={editWatermark}
-                  onChange={(e) => setEditWatermark(e.target.value)}
-                  maxLength={50}
-                />
-              </div>
-            </TabsContent>
 
             {/* Tab: Trim */}
             <TabsContent value="trim" className="mt-4 space-y-4">
@@ -717,40 +646,6 @@ function EditorContent() {
                   {formatTime(editStart)} — {formatTime(editStart + editDuration)}
                 </p>
               </div>
-            </TabsContent>
-
-            {/* Tab: Subtitles */}
-            <TabsContent value="subs" className="mt-4 space-y-3">
-              {clipWords.length > 0 ? (
-                <>
-                  <p className="text-xs text-(--muted-fg)">
-                    {clipWords.length} palabras detectadas en este rango
-                  </p>
-                  <div className="max-h-64 overflow-y-auto rounded-lg bg-(--surface-2) border border-(--line) p-3">
-                    <div className="flex flex-wrap gap-1">
-                      {clipWords.map((w, i) => (
-                        <span
-                          key={i}
-                          className="inline-block rounded bg-(--surface-3) px-1.5 py-0.5 text-xs font-mono"
-                          title={`${w.start.toFixed(2)}s — ${w.end.toFixed(2)}s`}
-                        >
-                          {w.word}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                  <p className="text-[10px] text-(--muted-fg)">
-                    Los subtitulos se re-generan automaticamente al re-renderizar con las palabras del nuevo rango.
-                  </p>
-                </>
-              ) : (
-                <div className="rounded-lg bg-(--surface-2) border border-(--line) p-4 text-center">
-                  <Subtitles className="mx-auto h-8 w-8 text-(--muted-fg) mb-2" />
-                  <p className="text-xs text-(--muted-fg)">
-                    Sin datos de transcripcion para este rango.
-                  </p>
-                </div>
-              )}
             </TabsContent>
 
             {/* Tab: Platform Copys */}
@@ -827,7 +722,7 @@ function EditorContent() {
             </Button>
             {!hasChanges && !rerendering && (
               <p className="mt-2 text-center text-[10px] text-(--muted-fg)">
-                Modifica el titulo, trim o marca de agua para habilitar
+                Modifica el trim para habilitar
               </p>
             )}
             {rerenderMsg && (

@@ -6,7 +6,6 @@ import {
   BarChart3,
   CheckCircle2,
   Clock,
-  Copy,
   Cpu,
   Download,
   ImageIcon,
@@ -38,6 +37,7 @@ import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { TopNav } from "@/components/top-nav";
 
 type ClipScores = {
   hook: number;
@@ -60,12 +60,52 @@ type ClipResult = {
   descriptions: { tiktok: string; instagram: string; youtube: string };
   thumbnailUrl?: string;
   hookApplied?: boolean;
+  variantUsed?: "safe" | "balanced" | "aggressive" | string;
+  narrativeScore?: number;
+  beatSummary?: string;
+  qualityFlags?: string[];
+  qualityGateStatus?: "pass" | "review" | string;
+  qualityGateScore?: number;
 };
 
 type ProcessResponse = {
   jobId: string;
   clips: ClipResult[];
   notes: string[];
+};
+
+type JobQualityReport = {
+  jobId: string;
+  generatedAt: string;
+  thresholds: {
+    minPassRatio: number;
+    minAvgGateScore: number;
+    minClipDurationSeconds: number;
+  };
+  summary: {
+    status: "pass" | "review";
+    clipCount: number;
+    passCount: number;
+    reviewCount: number;
+    passRatio: number;
+    avgGateScore: number;
+    avgOverallScore: number;
+    technicalIssueCount: number;
+    topIssues: Array<{ issue: string; count: number }>;
+  };
+  clips: Array<{
+    index: number;
+    fileName: string;
+    gateStatus: "pass" | "review";
+    gateScore: number;
+    expectedDurationSeconds: number;
+    outputDurationSeconds: number;
+    resolution: string;
+    hasAudio: boolean;
+    overallScore: number;
+    technicalIssues: string[];
+    qualityFlags: string[];
+  }>;
 };
 
 type ViralBenchmark = {
@@ -104,17 +144,56 @@ function formatFileSize(bytes: number) {
   return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`;
 }
 
+function clampScore(value?: number) {
+  if (typeof value !== "number" || Number.isNaN(value)) return null;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function getVariantStyles(variant?: string) {
+  switch (variant?.toLowerCase()) {
+    case "safe":
+      return "bg-emerald-500/15 text-emerald-300 border-emerald-500/25";
+    case "aggressive":
+      return "bg-rose-500/15 text-rose-300 border-rose-500/25";
+    case "balanced":
+      return "bg-sky-500/15 text-sky-300 border-sky-500/25";
+    default:
+      return "bg-(--muted)/30 text-(--muted-fg) border-(--line)";
+  }
+}
+
+function getVariantLabel(variant?: string) {
+  if (!variant) return null;
+  const normalized = variant.toLowerCase();
+  if (normalized === "safe" || normalized === "balanced" || normalized === "aggressive") {
+    return normalized;
+  }
+  return variant;
+}
+
+function getQualityGateStyles(status?: string) {
+  if (status?.toLowerCase() === "pass") {
+    return "bg-emerald-500/15 text-emerald-300 border-emerald-500/25";
+  }
+  if (status?.toLowerCase() === "review") {
+    return "bg-amber-500/15 text-amber-300 border-amber-500/25";
+  }
+  return "bg-(--muted)/30 text-(--muted-fg) border-(--line)";
+}
+
+function getQaStatusStyles(status?: string) {
+  if (status?.toLowerCase() === "pass") {
+    return "border-emerald-500/35 bg-emerald-500/10 text-emerald-300";
+  }
+  return "border-amber-500/35 bg-amber-500/10 text-amber-300";
+}
+
 
 export default function Home() {
   const [video, setVideo] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
-  const [title, setTitle] = useState("Momento viral del dia");
-  const [watermark, setWatermark] = useState("@TuCanal");
   const [clipCount, setClipCount] = useState(8);
-  const [subtitleSize, setSubtitleSize] = useState(44);
   const [splitScreen, setSplitScreen] = useState(true);
-  const [autoTitle, setAutoTitle] = useState(true);
-  const [captionPreset, setCaptionPreset] = useState("hormozi");
   const [hookOptimizer, setHookOptimizer] = useState(true);
   const [watermarkImage, setWatermarkImage] = useState("none");
   const [availableWatermarks, setAvailableWatermarks] = useState<
@@ -123,11 +202,14 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [response, setResponse] = useState<ProcessResponse | null>(null);
+  const [qualityReport, setQualityReport] = useState<JobQualityReport | null>(null);
+  const [qualityLoading, setQualityLoading] = useState(false);
+  const [qualityError, setQualityError] = useState<string | null>(null);
   const [processingStatus, setProcessingStatus] = useState(
     "En espera de configuracion.",
   );
   const [backendReady, setBackendReady] = useState<boolean | null>(null);
-  const [backendMessage, setBackendMessage] = useState("Verificando sistema...");
+  const [, setBackendMessage] = useState("Verificando sistema...");
   const [progressValue, setProgressValue] = useState(0);
   const [progressStage, setProgressStage] = useState("En espera");
   const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
@@ -215,8 +297,7 @@ export default function Home() {
     const sceneSec = Math.max(20, fileSizeMb * 0.08);
     const visualAnalysisSec = Math.max(15, fileSizeMb * 0.06); // GPT-4o Vision keyframe analysis
     const renderSec = clipCount * 12; // Variable duration clips average ~30s
-    const titleSec = clipCount * 3;
-    const estimateMs = (uploadTimeSec + transcriptionSec + sceneSec + visualAnalysisSec + renderSec + titleSec) * 1000;
+    const estimateMs = (uploadTimeSec + transcriptionSec + sceneSec + visualAnalysisSec + renderSec) * 1000;
 
     const update = () => {
       const elapsed = Date.now() - processingStartedAt;
@@ -234,7 +315,7 @@ export default function Home() {
       else if (ratio < 0.30) setProgressStage("Transcribiendo audio");
       else if (ratio < 0.45) setProgressStage("Analizando frames (Vision AI)");
       else if (ratio < 0.55) setProgressStage("Detectando momentos virales");
-      else if (ratio < 0.65) setProgressStage("Generando titulos");
+      else if (ratio < 0.65) setProgressStage("Optimizando clips");
       else setProgressStage("Renderizando clips");
     };
 
@@ -252,25 +333,42 @@ export default function Home() {
     if (file) setVideo(file);
   };
 
+  const fetchQualityReport = async (jobId: string) => {
+    setQualityLoading(true);
+    setQualityError(null);
+    try {
+      const res = await fetch(`/api/job/${encodeURIComponent(jobId)}/quality`, { cache: "no-store" });
+      const data = (await res.json()) as JobQualityReport | { error?: string };
+      if (!res.ok || !("summary" in data)) {
+        const message = "error" in data && data.error ? data.error : "No se pudo calcular el control de calidad.";
+        throw new Error(message);
+      }
+      setQualityReport(data);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Error desconocido en el control de calidad.";
+      setQualityError(message);
+      setQualityReport(null);
+    } finally {
+      setQualityLoading(false);
+    }
+  };
+
   const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!video) return;
 
     const form = new FormData();
     form.append("video", video);
-    form.append("title", title);
-    form.append("watermark", watermark);
     form.append("clips", String(clipCount));
-    form.append("subtitleSize", String(subtitleSize));
     form.append("splitScreen", String(splitScreen));
-    form.append("autoTitle", String(autoTitle));
-    form.append("captionPreset", captionPreset);
     form.append("hookOptimizer", String(hookOptimizer));
     form.append("watermarkImage", watermarkImage);
 
     setLoading(true);
     setError(null);
     setResponse(null);
+    setQualityReport(null);
+    setQualityError(null);
     setProgressValue(4);
     setProgressStage("Subiendo video");
     setEtaSeconds(null);
@@ -285,6 +383,7 @@ export default function Home() {
       }
       const payload = (await res.json()) as ProcessResponse;
       setResponse(payload);
+      await fetchQualityReport(payload.jobId);
       setProcessingStatus("Clips generados correctamente.");
       setProgressStage("Completado");
       setProgressValue(100);
@@ -373,9 +472,8 @@ export default function Home() {
 
   return (
     <div className="grain min-h-screen">
-{/* removed top nav — tool is personal, no navigation needed */}
-
       <main className="mx-auto w-full max-w-7xl px-4 py-8 sm:px-8">
+        <TopNav />
         {/* Hero */}
         <div className="mb-8">
           <h1 className="text-4xl font-bold tracking-tight sm:text-5xl">
@@ -474,35 +572,6 @@ export default function Home() {
 
                   {/* Tab: Text overlays */}
                   <TabsContent value="texto" className="space-y-5">
-                    <div className="flex items-center justify-between rounded-lg border border-(--line) bg-(--surface-2) px-4 py-3">
-                      <div>
-                        <p className="text-sm font-medium">Auto-titulo viral</p>
-                        <p className="text-xs text-(--muted-fg) mt-0.5">
-                          GPT genera un titulo unico y enganchante por cada clip.
-                        </p>
-                      </div>
-                      <Switch checked={autoTitle} onCheckedChange={setAutoTitle} />
-                    </div>
-
-                    <div className={`space-y-2 transition-opacity ${autoTitle ? "opacity-40 pointer-events-none" : ""}`}>
-                      <Label htmlFor="title">Titulo superior (manual)</Label>
-                      <Input
-                        id="title"
-                        value={title}
-                        onChange={(e) => setTitle(e.target.value)}
-                        placeholder="Lo que paso en este stream..."
-                        maxLength={80}
-                        disabled={autoTitle}
-                      />
-                      <p className="text-xs text-(--muted-fg)">
-                        {autoTitle
-                          ? "Desactiva auto-titulo para escribir un titulo fijo."
-                          : "Aparece en la barra oscura del top del video."}
-                      </p>
-                    </div>
-
-                    <Separator />
-
                     {/* Dynamic watermark selector */}
                     <div className="space-y-3">
                       <div className="flex items-center justify-between">
@@ -563,26 +632,9 @@ export default function Home() {
                         </div>
                       )}
                     </div>
-
-                    <Separator />
-
-                    <div className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <Label>Tamano de subtitulos</Label>
-                        <span className="font-mono text-sm text-(--accent)">{subtitleSize}px</span>
-                      </div>
-                      <Slider
-                        min={24}
-                        max={56}
-                        step={2}
-                        value={[subtitleSize]}
-                        onValueChange={([v]) => setSubtitleSize(v)}
-                      />
-                      <div className="flex justify-between text-xs text-(--muted-fg)">
-                        <span>24px</span>
-                        <span>56px</span>
-                      </div>
-                    </div>
+                    <p className="text-xs text-(--muted-fg)">
+                      Subtitulos y titulo en video desactivados en este pipeline. Puedes editarlos luego en CapCut.
+                    </p>
                   </TabsContent>
 
                   {/* Tab: Pipeline settings */}
@@ -602,37 +654,6 @@ export default function Home() {
                       <div className="flex justify-between text-xs text-(--muted-fg)">
                         <span>1 clip</span>
                         <span>20 clips</span>
-                      </div>
-                    </div>
-
-                    <Separator />
-
-                    {/* Caption preset selector */}
-                    <div className="space-y-3">
-                      <Label>Estilo de subtitulos</Label>
-                      <div className="grid grid-cols-3 gap-2">
-                        {([
-                          { id: "hormozi", name: "Hormozi", desc: "Bold, yellow highlight" },
-                          { id: "mrbeast", name: "MrBeast", desc: "Massive, red, energetico" },
-                          { id: "classic", name: "Clasico", desc: "Blanco con outline" },
-                          { id: "neon", name: "Neon", desc: "Glow cyan, gaming" },
-                          { id: "minimal", name: "Minimal", desc: "Discreto, con fondo" },
-                          { id: "karaoke-pop", name: "Karaoke Pop", desc: "Pop de escala, verde" },
-                        ] as const).map(({ id, name, desc }) => (
-                          <button
-                            key={id}
-                            type="button"
-                            onClick={() => setCaptionPreset(id)}
-                            className={`rounded-lg border px-3 py-2.5 text-left transition-all ${
-                              captionPreset === id
-                                ? "border-(--accent) bg-(--accent)/10 ring-1 ring-(--accent)/30"
-                                : "border-(--line) bg-(--surface-2) hover:border-(--line-2)"
-                            }`}
-                          >
-                            <p className="text-xs font-semibold">{name}</p>
-                            <p className="text-[10px] text-(--muted-fg) mt-0.5">{desc}</p>
-                          </button>
-                        ))}
                       </div>
                     </div>
 
@@ -744,15 +765,12 @@ export default function Home() {
                     { label: "Transcripcion Whisper-1", enabled: true },
                     { label: "Analisis visual GPT-4o Vision", enabled: true },
                     { label: "Deteccion multimodal (audio + video)", enabled: true },
-                    { label: `Caption preset: ${captionPreset}`, enabled: true },
                     { label: "Hook optimizer (spoiler hook)", enabled: hookOptimizer },
                     { label: "Thumbnails automaticos", enabled: true },
                     { label: "Hook text overlay", enabled: true },
                     { label: "Zoom dinamico en momentos clave", enabled: true },
                     { label: "Copys multi-plataforma (TikTok/IG/YT)", enabled: true },
-                    { label: "Subtitulos karaoke", enabled: true },
-                    { label: "Agrupacion inteligente de subtitulos", enabled: true },
-                    { label: "Auto-titulo viral", enabled: autoTitle },
+                    { label: "Subtitulos y titulo en overlay", enabled: false },
                     { label: "Duracion variable por contenido", enabled: true },
                     { label: "Filtro anti-publicidad", enabled: true },
                     { label: "Corte por frase", enabled: true },
@@ -809,6 +827,95 @@ export default function Home() {
                       {note}
                     </p>
                   ))}
+                </CardContent>
+              </Card>
+            )}
+
+            {(qualityLoading || qualityReport || qualityError) && (
+              <Card>
+                <CardHeader className="pb-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <CardTitle className="text-sm">Control de calidad</CardTitle>
+                    {qualityReport && (
+                      <Badge className={`border text-[10px] font-semibold uppercase tracking-wide ${getQaStatusStyles(qualityReport.summary.status)}`}>
+                        {qualityReport.summary.status === "pass" ? "PASS" : "REVIEW"}
+                      </Badge>
+                    )}
+                  </div>
+                  <CardDescription>
+                    Verificacion tecnica y narrativa real del job renderizado.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {qualityLoading && (
+                    <div className="flex items-center gap-2 text-xs text-(--muted-fg)">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Auditando clips con ffprobe...
+                    </div>
+                  )}
+
+                  {qualityError && !qualityLoading && (
+                    <p className="text-xs text-red-400">{qualityError}</p>
+                  )}
+
+                  {qualityReport && !qualityLoading && (
+                    <>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="rounded-lg border border-(--line) bg-(--surface-2) p-2">
+                          <p className="text-[10px] text-(--muted-fg)">PASS ratio</p>
+                          <p className="font-mono text-sm font-semibold">
+                            {(qualityReport.summary.passRatio * 100).toFixed(0)}%
+                          </p>
+                          <p className="text-[10px] text-(--muted-fg)">
+                            {qualityReport.summary.passCount}/{qualityReport.summary.clipCount} clips
+                          </p>
+                        </div>
+                        <div className="rounded-lg border border-(--line) bg-(--surface-2) p-2">
+                          <p className="text-[10px] text-(--muted-fg)">Gate promedio</p>
+                          <p className="font-mono text-sm font-semibold">{qualityReport.summary.avgGateScore.toFixed(1)}</p>
+                          <p className="text-[10px] text-(--muted-fg)">
+                            umbral {Math.round(qualityReport.thresholds.minAvgGateScore)}
+                          </p>
+                        </div>
+                      </div>
+
+                      {qualityReport.summary.topIssues.length > 0 && (
+                        <div className="space-y-1">
+                          <p className="text-[10px] font-semibold uppercase tracking-wide text-(--muted-fg)">
+                            Issues detectados
+                          </p>
+                          <div className="flex flex-wrap gap-1">
+                            {qualityReport.summary.topIssues.slice(0, 4).map((issue) => (
+                              <Badge
+                                key={issue.issue}
+                                className="border border-(--line) bg-(--muted)/30 text-[10px] text-(--foreground)"
+                              >
+                                {issue.issue} x{issue.count}
+                              </Badge>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="max-h-44 space-y-1 overflow-y-auto rounded-lg border border-(--line) bg-(--surface-2) p-2">
+                        {qualityReport.clips.map((clip) => (
+                          <div key={clip.fileName} className="rounded-md border border-(--line) bg-(--surface) px-2 py-1.5">
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="truncate text-[11px] font-medium">
+                                #{clip.index} {clip.fileName}
+                              </p>
+                              <Badge className={`border text-[10px] font-semibold uppercase tracking-wide ${getQaStatusStyles(clip.gateStatus)}`}>
+                                {clip.gateStatus} {clip.gateScore}
+                              </Badge>
+                            </div>
+                            <p className="mt-1 text-[10px] text-(--muted-fg)">
+                              {clip.resolution} · {clip.outputDurationSeconds.toFixed(1)}s · audio {clip.hasAudio ? "ok" : "no"}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
                 </CardContent>
               </Card>
             )}
@@ -1010,9 +1117,6 @@ export default function Home() {
                 </p>
               </div>
               <div className="flex items-center gap-2">
-                <Badge variant="success" className="font-mono">
-                  {response.clips.filter((c) => c.hasSubtitles).length}/{response.clips.length} subtitulos
-                </Badge>
                 <Button
                   variant="outline"
                   size="sm"
@@ -1034,7 +1138,7 @@ export default function Home() {
                     <video
                       controls
                       preload="metadata"
-                      className="absolute inset-0 h-full w-full object-contain"
+                      className="absolute inset-0 h-full w-full object-cover"
                       src={clip.url}
                       poster={clip.thumbnailUrl || undefined}
                     />
@@ -1054,11 +1158,6 @@ export default function Home() {
                         {clip.title || `Clip ${i + 1}`}
                       </span>
                       <div className="flex items-center gap-1.5 shrink-0">
-                        {clip.hasSubtitles && (
-                          <Badge variant="outline" className="text-[10px] py-0 px-1.5">
-                            SUB
-                          </Badge>
-                        )}
                         {clip.overallScore > 0 && (
                           <Badge variant="accent" className="font-mono text-[10px] py-0 px-1.5">
                             {clip.overallScore}/100
@@ -1092,6 +1191,60 @@ export default function Home() {
                             </div>
                           );
                         })}
+                      </div>
+                    )}
+
+                    {(clip.variantUsed ||
+                      clip.narrativeScore !== undefined ||
+                      clip.qualityGateStatus ||
+                      clip.qualityGateScore !== undefined ||
+                      clip.beatSummary ||
+                      (clip.qualityFlags?.length ?? 0) > 0) && (
+                      <div className="space-y-2 rounded-lg border border-(--line) bg-(--bg)/40 p-2.5">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {clip.qualityGateStatus && (
+                            <Badge
+                              className={`border text-[10px] font-semibold uppercase tracking-wide ${getQualityGateStyles(clip.qualityGateStatus)}`}
+                            >
+                              Gate {clip.qualityGateStatus}
+                              {clampScore(clip.qualityGateScore) !== null ? ` ${clampScore(clip.qualityGateScore)}` : ""}
+                            </Badge>
+                          )}
+                          {clip.variantUsed && (
+                            <Badge
+                              className={`border text-[10px] font-semibold uppercase tracking-wide ${getVariantStyles(clip.variantUsed)}`}
+                            >
+                              Variante {getVariantLabel(clip.variantUsed)}
+                            </Badge>
+                          )}
+                          {clampScore(clip.narrativeScore) !== null && (
+                            <Badge className="border border-(--line) bg-(--muted)/30 text-[10px] font-semibold text-(--foreground)">
+                              Narrative {clampScore(clip.narrativeScore)}/100
+                            </Badge>
+                          )}
+                          {(clip.qualityFlags?.length ?? 0) > 0 && (
+                            <Badge className="border border-(--line) bg-(--muted)/30 text-[10px] font-semibold text-(--muted-fg)">
+                              {clip.qualityFlags!.length} flags
+                            </Badge>
+                          )}
+                        </div>
+                        {clip.beatSummary && (
+                          <p className="text-[11px] leading-4 text-(--muted-fg) line-clamp-2">
+                            {clip.beatSummary}
+                          </p>
+                        )}
+                        {(clip.qualityFlags?.length ?? 0) > 0 && (
+                          <div className="flex flex-wrap gap-1">
+                            {clip.qualityFlags!.slice(0, 4).map((flag) => (
+                              <Badge
+                                key={flag}
+                                className="border border-(--line) bg-black/10 text-[10px] font-medium text-(--foreground)"
+                              >
+                                {flag}
+                              </Badge>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     )}
 
