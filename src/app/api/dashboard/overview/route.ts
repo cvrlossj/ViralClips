@@ -15,6 +15,7 @@ import {
 } from "@/lib/social-analytics";
 import { readDashboardCache, writeDashboardCache } from "@/lib/dashboard-cache";
 import { toRapidApiMessage } from "@/lib/rapidapi-client";
+import { trainAdaptiveScoringFromPlatformReports } from "@/lib/adaptive-learning";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -836,6 +837,29 @@ function withCacheMeta(payload: DashboardPayload, cache: CacheInfo): DashboardPa
   };
 }
 
+async function updateAdaptiveScoring(
+  reports: PlatformReport[],
+  force: boolean,
+): Promise<void> {
+  try {
+    await trainAdaptiveScoringFromPlatformReports(
+      reports.map((report) => ({
+        platform: report.platform,
+        status: report.status,
+        topVideos: report.topVideos.map((video) => ({
+          views: video.views,
+          durationSeconds: video.durationSeconds,
+          engagementRate: video.engagementRate,
+        })),
+        timeline: report.timeline,
+      })),
+      { force },
+    );
+  } catch {
+    // Keep dashboard response resilient even if adaptive training fails.
+  }
+}
+
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const forceRefresh = ["1", "true", "yes"].includes(
@@ -847,6 +871,10 @@ export async function GET(request: Request) {
   const cached = await readDashboardCache<DashboardPayload>(OVERVIEW_CACHE_KEY);
 
   if (cached && !cached.stale && !forceRefresh) {
+    await updateAdaptiveScoring(
+      [cached.data.accounts.tiktok, cached.data.accounts.youtube, cached.data.accounts.facebook],
+      false,
+    );
     return NextResponse.json(
       withCacheMeta(
         cached.data,
@@ -873,6 +901,10 @@ export async function GET(request: Request) {
 
   const allUnavailable = [tiktok, youtube, facebook].every((report) => report.status === "unavailable");
   if (allUnavailable && cached?.data) {
+    await updateAdaptiveScoring(
+      [cached.data.accounts.tiktok, cached.data.accounts.youtube, cached.data.accounts.facebook],
+      false,
+    );
     return NextResponse.json(
       withCacheMeta(
         cached.data,
@@ -905,6 +937,7 @@ export async function GET(request: Request) {
   };
 
   await writeDashboardCache(OVERVIEW_CACHE_KEY, payload, cacheTtlMs);
+  await updateAdaptiveScoring([tiktok, youtube, facebook], forceRefresh);
 
   return NextResponse.json(
     withCacheMeta(payload, buildCacheInfo("live", 0, cacheTtlMs, forceRefresh)),

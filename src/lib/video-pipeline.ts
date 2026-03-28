@@ -33,6 +33,11 @@ import {
   type ViralBenchmark,
 } from "@/lib/tiktok-analytics";
 import {
+  formatAdaptiveProfileSummary,
+  readAdaptiveScoringProfile,
+  type AdaptiveScoringProfile,
+} from "@/lib/adaptive-learning";
+import {
   canTranscribe,
   transcribeVerbose,
   type TranscriptWord,
@@ -225,12 +230,36 @@ type SelectedMoment = {
   qualityGateScore?: number;
 };
 
-function mergeClipScores(base: ClipScores, beat: BeatEvaluation): ClipScores {
+function mergeClipScores(
+  base: ClipScores,
+  beat: BeatEvaluation,
+  profile: AdaptiveScoringProfile,
+): ClipScores {
+  const mergeWeights = profile.weights.mergeClipScores;
   return {
-    hook: clamp(Math.round(base.hook * 0.35 + beat.hookScore * 0.65), 0, 100),
-    flow: clamp(Math.round(base.flow * 0.45 + beat.narrativeScore * 0.55), 0, 100),
-    engagement: clamp(Math.round(base.engagement * 0.4 + beat.engagementScore * 0.6), 0, 100),
-    completeness: clamp(Math.round(base.completeness * 0.25 + beat.completenessScore * 0.75), 0, 100),
+    hook: clamp(
+      Math.round(base.hook * mergeWeights.hook.base + beat.hookScore * mergeWeights.hook.beat),
+      0,
+      100,
+    ),
+    flow: clamp(
+      Math.round(base.flow * mergeWeights.flow.base + beat.narrativeScore * mergeWeights.flow.beat),
+      0,
+      100,
+    ),
+    engagement: clamp(
+      Math.round(base.engagement * mergeWeights.engagement.base + beat.engagementScore * mergeWeights.engagement.beat),
+      0,
+      100,
+    ),
+    completeness: clamp(
+      Math.round(
+        base.completeness * mergeWeights.completeness.base +
+        beat.completenessScore * mergeWeights.completeness.beat,
+      ),
+      0,
+      100,
+    ),
   };
 }
 
@@ -329,31 +358,43 @@ function scoreNarrativeVariant(params: {
   moment: DetectedMoment;
   beat: BeatEvaluation;
   kind: NarrativeVariantKind;
+  profile: AdaptiveScoringProfile;
 }) {
-  const { moment, beat, kind } = params;
+  const { moment, beat, kind, profile } = params;
+  const variantWeights = profile.weights.variant;
   const narrativeScore = clamp(
     Math.round(
-      beat.narrativeScore * 0.48 +
-      beat.completenessScore * 0.24 +
-      beat.beatCoverageScore * 0.16 +
-      moment.scores.flow * 0.12,
+      beat.narrativeScore * variantWeights.narrative.narrative +
+      beat.completenessScore * variantWeights.narrative.completeness +
+      beat.beatCoverageScore * variantWeights.narrative.beatCoverage +
+      moment.scores.flow * variantWeights.narrative.flow,
     ),
     0,
     100,
   );
   const engagementScore = clamp(
     Math.round(
-      beat.engagementScore * 0.58 +
-      beat.hookScore * 0.22 +
-      moment.scores.engagement * 0.20,
+      beat.engagementScore * variantWeights.engagement.beatEngagement +
+      beat.hookScore * variantWeights.engagement.beatHook +
+      moment.scores.engagement * variantWeights.engagement.momentEngagement,
     ),
     0,
     100,
   );
-  const kindBias = kind === "safe" ? 1 : kind === "balanced" ? 0 : 2;
-  const flatPenalty = beat.flatRisk ? 18 : 0;
+  const kindBias =
+    kind === "safe"
+      ? variantWeights.kindBias.safe
+      : kind === "balanced"
+        ? variantWeights.kindBias.balanced
+        : variantWeights.kindBias.aggressive;
+  const flatPenalty = beat.flatRisk ? variantWeights.flatPenalty : 0;
   const overallScore = clamp(
-    Math.round(narrativeScore * 0.58 + engagementScore * 0.42 + kindBias - flatPenalty),
+    Math.round(
+      narrativeScore * variantWeights.overall.narrative +
+      engagementScore * variantWeights.overall.engagement +
+      kindBias -
+      flatPenalty,
+    ),
     0,
     100,
   );
@@ -361,39 +402,45 @@ function scoreNarrativeVariant(params: {
   return { narrativeScore, engagementScore, overallScore };
 }
 
-function isAntiFlatBeat(evaluation: BeatEvaluation) {
-  return evaluation.flatRisk || (evaluation.hookScore < 35 && evaluation.completenessScore < 62);
+function isAntiFlatBeat(evaluation: BeatEvaluation, profile: AdaptiveScoringProfile) {
+  const antiFlat = profile.weights.antiFlat;
+  return (
+    evaluation.flatRisk ||
+    (evaluation.hookScore < antiFlat.hookFloor && evaluation.completenessScore < antiFlat.completenessFloor)
+  );
 }
 
 function evaluateNarrativeQualityGate(params: {
   beat: BeatEvaluation;
   narrativeScore: number;
   engagementScore: number;
+  profile: AdaptiveScoringProfile;
 }): { status: "pass" | "review"; score: number; issues: string[] } {
-  const { beat, narrativeScore, engagementScore } = params;
+  const { beat, narrativeScore, engagementScore, profile } = params;
+  const gate = profile.weights.qualityGate;
   const issues: string[] = [];
 
-  if (beat.hookScore < 38) issues.push("hook-bajo");
-  if (beat.completenessScore < 62) issues.push("completitud-baja");
+  if (beat.hookScore < gate.thresholds.hook) issues.push("hook-bajo");
+  if (beat.completenessScore < gate.thresholds.completeness) issues.push("completitud-baja");
   if (beat.missingBeats.includes("payoff")) issues.push("sin-payoff");
   if (beat.missingBeats.includes("reaction")) issues.push("sin-reaccion");
-  if (narrativeScore < 62) issues.push("narrativa-baja");
-  if (engagementScore < 58) issues.push("engagement-bajo");
+  if (narrativeScore < gate.thresholds.narrative) issues.push("narrativa-baja");
+  if (engagementScore < gate.thresholds.engagement) issues.push("engagement-bajo");
 
-  const penalty = issues.length * 9;
+  const penalty = issues.length * gate.issuePenalty;
   const score = clamp(
     Math.round(
-      beat.completenessScore * 0.34 +
-      narrativeScore * 0.32 +
-      engagementScore * 0.20 +
-      beat.hookScore * 0.14 -
+      beat.completenessScore * gate.blend.completeness +
+      narrativeScore * gate.blend.narrative +
+      engagementScore * gate.blend.engagement +
+      beat.hookScore * gate.blend.hook -
       penalty,
     ),
     0,
     100,
   );
 
-  const pass = score >= 60 && !issues.includes("sin-payoff") && !issues.includes("sin-reaccion");
+  const pass = score >= gate.passMinScore && !issues.includes("sin-payoff") && !issues.includes("sin-reaccion");
   return {
     status: pass ? "pass" : "review",
     score,
@@ -834,6 +881,7 @@ function findBestThumbnailTime(
 export async function processVideo(input: PipelineInput): Promise<PipelineResult> {
   const jobId = `${Date.now()}_${randomUUID().slice(0, 8)}`;
   await ensureStorageFolders();
+  const adaptiveProfile = await readAdaptiveScoringProfile();
 
   // The file is already saved to disk by the route handler (streaming upload).
   // We just rename/move it into our upload directory with a job-specific name.
@@ -1089,25 +1137,27 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
             moment: variantMoment,
             beat: variantBeat,
             kind,
+            profile: adaptiveProfile,
           });
           const qualityGate = evaluateNarrativeQualityGate({
             beat: variantBeat,
             narrativeScore: variantScores.narrativeScore,
             engagementScore: variantScores.engagementScore,
+            profile: adaptiveProfile,
           });
 
           return {
             kind,
             moment: {
               ...variantMoment,
-              scores: mergeClipScores(variantMoment.scores, variantBeat),
+              scores: mergeClipScores(variantMoment.scores, variantBeat, adaptiveProfile),
               overallScore: variantScores.overallScore,
             },
             beat: variantBeat,
             narrativeScore: variantScores.narrativeScore,
             engagementScore: variantScores.engagementScore,
             overallScore: variantScores.overallScore,
-            discardedByAntiFlat: isAntiFlatBeat(variantBeat),
+            discardedByAntiFlat: isAntiFlatBeat(variantBeat, adaptiveProfile),
             qualityGateStatus: qualityGate.status,
             qualityGateScore: qualityGate.score,
             qualityGateIssues: qualityGate.issues,
@@ -1422,10 +1472,12 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
       benchmarkContext
         ? "Benchmark TikTok activo: scoring calibrado con datos reales."
         : "Sin benchmark TikTok: scoring basado en criterios del LLM.",
+      formatAdaptiveProfileSummary(adaptiveProfile),
       `Render: preset=${clipVideoPreset} crf=${clipVideoCrf} audio=${clipAudioBitrate}.`,
       sceneChanges.length > 0
         ? `Cambios de escena detectados: ${sceneChanges.length}.`
         : "Sin cambios de escena detectados.",
+      "Scene smoothing activo: cortes guiados por narrativa + boundaries de escena menos agresivos.",
       ...diagnostics,
       "Anti-copyright: pitch shift +2%, color shift, watermark overlay.",
       "Formato de salida: vertical 1080x1920.",

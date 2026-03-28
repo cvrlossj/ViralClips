@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { runFfprobe } from "@/lib/ffmpeg";
 import type { TranscriptSegment } from "@/lib/transcription";
+import { getAdaptiveScoringProfile } from "@/lib/adaptive-learning";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -101,7 +102,19 @@ function readDurationEnv(name: string, fallback: number, min: number, max: numbe
   return Math.max(min, Math.min(max, Math.round(raw)));
 }
 
+function readFloatEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = Number(process.env[name]);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.max(min, Math.min(max, raw));
+}
+
 const MIN_CLIP_DURATION_TARGET_SEC = readDurationEnv("CLIP_MIN_DURATION_SECONDS", 36, 20, 120);
+const SCENE_DETECT_THRESHOLD_SHORT = readFloatEnv("SCENE_DETECT_THRESHOLD_SHORT", 0.39, 0.2, 0.8);
+const SCENE_DETECT_THRESHOLD_LONG = readFloatEnv("SCENE_DETECT_THRESHOLD_LONG", 0.47, 0.2, 0.9);
+const SCENE_CHANGE_MIN_GAP_SECONDS = readFloatEnv("SCENE_CHANGE_MIN_GAP_SECONDS", 1.35, 0.35, 6);
+const SCENE_CHANGE_MAX_PER_MINUTE = readFloatEnv("SCENE_CHANGE_MAX_PER_MINUTE", 18, 4, 80);
+const SCENE_BOUNDARY_SNAP_MIN_GAP_SEC = readFloatEnv("SCENE_BOUNDARY_SNAP_MIN_GAP_SEC", 1.1, 0.2, 6);
+const SCENE_NEAR_WINDOW_SEC = readFloatEnv("SCENE_NEAR_WINDOW_SEC", 0.9, 0.2, 3);
 
 // ---------------------------------------------------------------------------
 // Ad / sponsor detection
@@ -159,13 +172,63 @@ function normalizePathForMovieFilter(filePath: string) {
     .replace(/'/g, "\\'");
 }
 
+function filterSceneChangesByGap(values: number[], minGapSeconds: number): number[] {
+  const ordered = [...values].sort((a, b) => a - b);
+  if (ordered.length <= 1) return ordered;
+
+  const filtered: number[] = [ordered[0]];
+  let last = ordered[0];
+
+  for (let i = 1; i < ordered.length; i += 1) {
+    const current = ordered[i];
+    if (current - last >= minGapSeconds) {
+      filtered.push(current);
+      last = current;
+    }
+  }
+
+  return filtered;
+}
+
+function smoothSceneChanges(rawSceneChanges: number[], durationSeconds?: number): number[] {
+  const cleaned = rawSceneChanges
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .sort((a, b) => a - b);
+  if (cleaned.length <= 1) return cleaned.map((value) => round2(value));
+
+  const videoDuration = Math.max(
+    1,
+    Number.isFinite(durationSeconds) && (durationSeconds ?? 0) > 0
+      ? Number(durationSeconds)
+      : cleaned[cleaned.length - 1],
+  );
+  const maxChanges = Math.max(8, Math.round((videoDuration / 60) * SCENE_CHANGE_MAX_PER_MINUTE));
+
+  let minGap = SCENE_CHANGE_MIN_GAP_SECONDS;
+  let filtered = filterSceneChangesByGap(cleaned, minGap);
+
+  let guard = 0;
+  while (filtered.length > maxChanges && guard < 8) {
+    minGap *= 1.2;
+    filtered = filterSceneChangesByGap(cleaned, minGap);
+    guard += 1;
+  }
+
+  if (filtered.length > maxChanges) {
+    const step = Math.ceil(filtered.length / maxChanges);
+    filtered = filtered.filter((_value, index) => index % step === 0);
+  }
+
+  return filtered.map((value) => round2(value));
+}
+
 export async function detectSceneChangeTimes(
   videoPath: string,
   durationSeconds?: number,
 ): Promise<number[]> {
   try {
     const isLong = (durationSeconds ?? 0) > 600;
-    const threshold = isLong ? 0.42 : 0.34;
+    const threshold = isLong ? SCENE_DETECT_THRESHOLD_LONG : SCENE_DETECT_THRESHOLD_SHORT;
 
     const moviePath = normalizePathForMovieFilter(videoPath);
     const filter = `movie='${moviePath}',select=gt(scene\\,${threshold})`;
@@ -190,10 +253,11 @@ export async function detectSceneChangeTimes(
 
     const output = await runFfprobe(args);
 
-    return output
+    const rawSceneChanges = output
       .split(/\r?\n/)
       .map((line) => Number(line.split(",")[0].trim()))
       .filter((value) => Number.isFinite(value) && value >= 0);
+    return smoothSceneChanges(rawSceneChanges, durationSeconds);
   } catch {
     return [];
   }
@@ -233,6 +297,8 @@ export async function detectMomentsWithLlm(params: {
   if (!llmClient) return null;
 
   const { segments, sceneChanges, adSegments, videoDuration, maxClips, visualContext, benchmarkContext } = params;
+  const profile = getAdaptiveScoringProfile();
+  const clipWeights = profile.weights.clipOverall;
   if (segments.length === 0) return null;
 
   const transcript = buildTimestampedTranscript(segments);
@@ -361,10 +427,10 @@ Los timestamps deben ser en SEGUNDOS (decimal).`;
 
         // Weighted overall score (matching OpusClip's priorities)
         const overallScore = Math.round(
-          scores.hook * 0.35 +
-          scores.flow * 0.20 +
-          scores.engagement * 0.30 +
-          scores.completeness * 0.15,
+          scores.hook * clipWeights.hook +
+          scores.flow * clipWeights.flow +
+          scores.engagement * clipWeights.engagement +
+          scores.completeness * clipWeights.completeness,
         );
 
         // Get transcript preview for this range
@@ -832,7 +898,7 @@ function findBestBeatEvent(
     const relativeStart = (segment.start - moment.start) / clipDuration;
     const relativeCenter = (segmentCenter - moment.start) / clipDuration;
     const nearSceneChange = sceneChanges.some(
-      (scene) => Math.abs(scene - segmentCenter) <= 1.5,
+      (scene) => Math.abs(scene - segmentCenter) <= SCENE_NEAR_WINDOW_SEC,
     );
 
     let score = 0;
@@ -845,7 +911,7 @@ function findBestBeatEvent(
         score += scoreSegmentText(text, BEAT_HOOK_RE) * 28;
         score += scoreSegmentText(text, BEAT_PAYOFF_RE) * 8;
         score += /[!?¡¿]/.test(text) ? 12 : 0;
-        score += nearSceneChange && relativeStart <= 0.22 ? 10 : 0;
+        score += nearSceneChange && relativeStart <= 0.22 ? 4 : 0;
         score += countWords(text) <= 12 ? 8 : 0;
         if (BEAT_HOOK_RE.test(lower)) reasons.push("hook cue");
         if (/[!?¡¿]/.test(text)) reasons.push("punctuation");
@@ -856,7 +922,7 @@ function findBestBeatEvent(
         score += relativeStart <= 0.24 ? 16 : 0;
         score += scoreSegmentText(text, BEAT_SETUP_RE) * 30;
         score += /[.?!…]$/.test(text) ? 6 : 0;
-        score += nearSceneChange && relativeStart <= 0.32 ? 8 : 0;
+        score += nearSceneChange && relativeStart <= 0.32 ? 3 : 0;
         if (BEAT_SETUP_RE.test(lower)) reasons.push("setup cue");
         if (nearSceneChange) reasons.push("scene shift");
         break;
@@ -866,7 +932,7 @@ function findBestBeatEvent(
         score += scoreSegmentText(text, BEAT_BUILDCUP_RE) * 28;
         score += countWords(text) >= 6 ? 6 : 0;
         score += /[—–-]/.test(text) ? 4 : 0;
-        score += nearSceneChange ? 6 : 0;
+        score += nearSceneChange ? 3 : 0;
         if (BEAT_BUILDCUP_RE.test(lower)) reasons.push("buildup cue");
         if (nearSceneChange) reasons.push("scene shift");
         break;
@@ -875,7 +941,7 @@ function findBestBeatEvent(
         score += relativeStart >= 0.30 ? 10 : 0;
         score += scoreSegmentText(text, BEAT_PAYOFF_RE) * 34;
         score += /[!?¡¿]/.test(text) ? 12 : 0;
-        score += nearSceneChange ? 10 : 0;
+        score += nearSceneChange ? 5 : 0;
         if (BEAT_PAYOFF_RE.test(lower)) reasons.push("payoff cue");
         if (nearSceneChange) reasons.push("scene shift");
         break;
@@ -884,7 +950,7 @@ function findBestBeatEvent(
         score += relativeStart >= 0.45 ? 12 : 0;
         score += scoreSegmentText(text, BEAT_REACTION_RE) * 32;
         score += /[!?¡¿]/.test(text) ? 8 : 0;
-        score += nearSceneChange ? 4 : 0;
+        score += nearSceneChange ? 2 : 0;
         if (BEAT_REACTION_RE.test(lower)) reasons.push("reaction cue");
         if (nearSceneChange) reasons.push("scene shift");
         break;
@@ -950,6 +1016,7 @@ export function evaluateMomentBeats(params: {
   segments: TranscriptSegment[];
   sceneChanges: number[];
 }): BeatEvaluation {
+  const profile = getAdaptiveScoringProfile();
   const { moment, segments, sceneChanges } = params;
   const orderedSegments = segments
     .filter((segment) => overlapSeconds(moment.start, moment.end, segment.start, segment.end) > 0)
@@ -980,13 +1047,14 @@ export function evaluateMomentBeats(params: {
   const buildupScore = byLabel.get("buildup")?.score ?? 0;
   const payoffScore = byLabel.get("payoff")?.score ?? 0;
   const reactionScore = byLabel.get("reaction")?.score ?? 0;
+  const beatCoverageWeights = profile.weights.beatCoverage;
   const beatCoverageScore = clamp(
     Math.round(
-      hookScore * 0.18 +
-      setupScore * 0.20 +
-      buildupScore * 0.22 +
-      payoffScore * 0.24 +
-      reactionScore * 0.16,
+      hookScore * beatCoverageWeights.hook +
+      setupScore * beatCoverageWeights.setup +
+      buildupScore * beatCoverageWeights.buildup +
+      payoffScore * beatCoverageWeights.payoff +
+      reactionScore * beatCoverageWeights.reaction,
     ),
     0,
     100,
@@ -1003,21 +1071,23 @@ export function evaluateMomentBeats(params: {
     100,
   );
 
+  const narrativeBlend = profile.weights.narrativeBlend;
   const narrativeScore = clamp(
     Math.round(
-      completenessScore * 0.42 +
-      beatCoverageScore * 0.26 +
-      (moment.scores.flow ?? 0) * 0.16 +
-      hookScore * 0.16,
+      completenessScore * narrativeBlend.completeness +
+      beatCoverageScore * narrativeBlend.beatCoverage +
+      (moment.scores.flow ?? 0) * narrativeBlend.flow +
+      hookScore * narrativeBlend.hook,
     ),
     0,
     100,
   );
+  const engagementBlend = profile.weights.engagementBlend;
   const engagementScore = clamp(
     Math.round(
-      (moment.scores.engagement ?? 0) * 0.55 +
-      Math.max(payoffScore, reactionScore) * 0.30 +
-      hookScore * 0.15,
+      (moment.scores.engagement ?? 0) * engagementBlend.momentEngagement +
+      Math.max(payoffScore, reactionScore) * engagementBlend.climax +
+      hookScore * engagementBlend.hook,
     ),
     0,
     100,
@@ -1032,7 +1102,11 @@ export function evaluateMomentBeats(params: {
     return clamp(findAnchorTimestamp(moment, orderedSegments), moment.start, moment.end);
   })();
 
-  const flatRisk = hookScore < 40 && (missingBeats.length >= 2 || completenessScore < 58);
+  const antiFlatConfig = profile.weights.antiFlat;
+  const flatRisk = hookScore < antiFlatConfig.flatRiskHook && (
+    missingBeats.length >= antiFlatConfig.flatRiskMissingBeats ||
+    completenessScore < antiFlatConfig.flatRiskCompleteness
+  );
   const evaluation: BeatEvaluation = {
     anchorTimestamp: round2Narrative(anchorTimestamp),
     events: events.sort((a, b) => a.timestamp - b.timestamp),
@@ -1084,7 +1158,11 @@ function collectStartBoundaries(
   for (const scene of sceneChanges) {
     if (!Number.isFinite(scene)) continue;
     if (scene <= 0 || scene >= videoDuration) continue;
-    set.add(round2(scene));
+    const rounded = round2(scene);
+    const hasNearbyBoundary = [...set].some((value) => Math.abs(value - rounded) < SCENE_BOUNDARY_SNAP_MIN_GAP_SEC);
+    if (!hasNearbyBoundary) {
+      set.add(rounded);
+    }
   }
 
   return [...set].sort((a, b) => a - b);
@@ -1114,7 +1192,11 @@ function collectEndBoundaries(
   for (const scene of sceneChanges) {
     if (!Number.isFinite(scene)) continue;
     if (scene <= 0 || scene >= videoDuration) continue;
-    set.add(round2(scene));
+    const rounded = round2(scene);
+    const hasNearbyBoundary = [...set].some((value) => Math.abs(value - rounded) < SCENE_BOUNDARY_SNAP_MIN_GAP_SEC);
+    if (!hasNearbyBoundary) {
+      set.add(rounded);
+    }
   }
 
   return [...set].sort((a, b) => a - b);
@@ -1392,6 +1474,8 @@ export function buildHeuristicMoments(params: {
   videoDuration: number;
   maxClips: number;
 }): DetectedMoment[] {
+  const profile = getAdaptiveScoringProfile();
+  const clipWeights = profile.weights.clipOverall;
   const { segments, sceneChanges, adSegments, videoDuration, maxClips } = params;
   if (segments.length === 0) return [];
 
@@ -1427,6 +1511,7 @@ export function buildHeuristicMoments(params: {
       const density = words / size;
       const hooks = hookCount(text);
       const scenes = sceneChanges.filter((t) => t >= start && t <= end).length;
+      const sceneSignal = Math.min(scenes, Math.ceil(size / 8));
       const narrativeReport = evaluateNarrativeBeatReport({
         segments: inside,
         start,
@@ -1441,13 +1526,16 @@ export function buildHeuristicMoments(params: {
 
       const hookScore = clamp(Math.round(hooks * 15 + (startClean ? 20 : 0)), 0, 100);
       const flowScore = clamp(Math.round(speechCoverage * 80 + density * 5), 0, 100);
-      const engagementScore = clamp(Math.round(hooks * 12 + scenes * 8 + density * 8), 0, 100);
+      const engagementScore = clamp(Math.round(hooks * 12 + sceneSignal * 4 + density * 8), 0, 100);
       const completenessScore = clamp(Math.round(
         (startClean ? 35 : 0) + (endClean ? 35 : 0) + speechCoverage * 30,
       ), 0, 100);
 
       const coreScore = Math.round(
-        hookScore * 0.35 + flowScore * 0.20 + engagementScore * 0.30 + completenessScore * 0.15,
+        hookScore * clipWeights.hook +
+        flowScore * clipWeights.flow +
+        engagementScore * clipWeights.engagement +
+        completenessScore * clipWeights.completeness,
       );
       const narrativeAdjustment = Math.round((narrativeReport.score - 50) * 0.2);
       const narrativePenalty =
@@ -1473,7 +1561,7 @@ export function buildHeuristicMoments(params: {
           completeness: completenessScore,
         },
         overallScore: overall,
-        rationale: `densidad ${density.toFixed(1)} · cobertura ${(speechCoverage * 100).toFixed(0)}% · hooks ${hooks} · escenas ${scenes} · narrativa ${narrativeReport.score}/100${narrativePenalty > 0 ? ` (-${narrativePenalty})` : ""}`,
+        rationale: `densidad ${density.toFixed(1)} · cobertura ${(speechCoverage * 100).toFixed(0)}% · hooks ${hooks} · escenas ${sceneSignal}/${scenes} · narrativa ${narrativeReport.score}/100${narrativePenalty > 0 ? ` (-${narrativePenalty})` : ""}`,
         transcriptPreview: preview,
       });
     }
