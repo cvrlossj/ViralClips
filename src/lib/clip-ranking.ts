@@ -108,7 +108,7 @@ function readFloatEnv(name: string, fallback: number, min: number, max: number):
   return Math.max(min, Math.min(max, raw));
 }
 
-const MIN_CLIP_DURATION_TARGET_SEC = readDurationEnv("CLIP_MIN_DURATION_SECONDS", 36, 20, 120);
+const MIN_CLIP_DURATION_TARGET_SEC = readDurationEnv("CLIP_MIN_DURATION_SECONDS", 48, 20, 120);
 const SCENE_DETECT_THRESHOLD_SHORT = readFloatEnv("SCENE_DETECT_THRESHOLD_SHORT", 0.39, 0.2, 0.8);
 const SCENE_DETECT_THRESHOLD_LONG = readFloatEnv("SCENE_DETECT_THRESHOLD_LONG", 0.47, 0.2, 0.9);
 const SCENE_CHANGE_MIN_GAP_SECONDS = readFloatEnv("SCENE_CHANGE_MIN_GAP_SECONDS", 1.35, 0.35, 6);
@@ -413,7 +413,8 @@ Los timestamps deben ser en SEGUNDOS (decimal).`;
         const end = Number(m.end);
         const duration = end - start;
 
-        // Validate: must be 15-180s, finite, within video bounds
+        // Validate raw LLM windows first. Short windows can still be expanded later
+        // by the narrative-refinement/variant passes in the pipeline.
         if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
         if (duration < 20 || duration > 180) return null;
         if (start < 0 || end > videoDuration + 2) return null;
@@ -1479,8 +1480,14 @@ export function buildHeuristicMoments(params: {
   const { segments, sceneChanges, adSegments, videoDuration, maxClips } = params;
   if (segments.length === 0) return [];
 
-  // Build candidate windows of varying sizes, prioritizing long-form context
-  const windowSizes = [36, 45, 60, 75];
+  // Build candidate windows of varying sizes, prioritizing context completeness.
+  const baseWindow = Math.max(MIN_CLIP_DURATION_TARGET_SEC, 36);
+  const windowSizes = [
+    baseWindow,
+    clamp(baseWindow + 12, baseWindow, 140),
+    clamp(baseWindow + 24, baseWindow, 165),
+    clamp(baseWindow + 36, baseWindow, 180),
+  ];
   const candidates: DetectedMoment[] = [];
 
   for (const size of windowSizes) {

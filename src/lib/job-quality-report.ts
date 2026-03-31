@@ -65,7 +65,7 @@ function readNumberEnv(name: string, fallback: number, min: number, max: number)
 
 const MIN_PASS_RATIO = readNumberEnv("QUALITY_MIN_PASS_RATIO", 0.6, 0.2, 1);
 const MIN_AVG_GATE_SCORE = readNumberEnv("QUALITY_MIN_AVG_GATE_SCORE", 62, 40, 95);
-const MIN_CLIP_DURATION_SECONDS = readNumberEnv("CLIP_MIN_DURATION_SECONDS", 36, 20, 120);
+const MIN_CLIP_DURATION_SECONDS = readNumberEnv("CLIP_MIN_DURATION_SECONDS", 48, 20, 120);
 
 function sanitizeJobId(value: string) {
   return path.basename(value).replace(/[^a-zA-Z0-9._-]/g, "");
