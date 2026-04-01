@@ -23,6 +23,18 @@ export function parseMultipart(request: Request): Promise<UploadResult> {
     let fileName = "";
     let fileReceived = false;
 
+    // Track both busboy parsing and disk write completion separately.
+    // On Windows, the write stream may still be flushing when busboy fires
+    // "finish", causing ffprobe to read an incomplete file.
+    let busboyDone = false;
+    let writeDone = false;
+
+    function tryResolve() {
+      if (busboyDone && writeDone) {
+        resolve({ filePath, fileName, fields });
+      }
+    }
+
     const busboy = Busboy({
       headers: { "content-type": contentType },
       limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB
@@ -38,6 +50,10 @@ export function parseMultipart(request: Request): Promise<UploadResult> {
       stream.pipe(writeStream);
 
       writeStream.on("error", (err) => reject(err));
+      writeStream.on("finish", () => {
+        writeDone = true;
+        tryResolve();
+      });
     });
 
     busboy.on("field", (name, value) => {
@@ -49,7 +65,8 @@ export function parseMultipart(request: Request): Promise<UploadResult> {
         reject(new Error("No se recibio ningun archivo de video."));
         return;
       }
-      resolve({ filePath, fileName, fields });
+      busboyDone = true;
+      tryResolve();
     });
 
     busboy.on("error", (err) => reject(err));
