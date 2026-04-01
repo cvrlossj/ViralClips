@@ -68,6 +68,8 @@ export async function POST(request: Request) {
         ? error.message
         : "Error interno procesando el video largo.";
 
+    console.error("[process-longform] Error:", error);
+
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

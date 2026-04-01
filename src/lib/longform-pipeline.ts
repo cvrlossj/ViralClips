@@ -477,6 +477,10 @@ export async function compileLongformVideo(input: LongformInput): Promise<Longfo
     : `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1`;
 
   // Get video info
+  console.log(`[longform] filePath: ${filePath}`);
+  const fileStats = await fs.stat(filePath).catch((e) => { throw new Error(`Archivo no encontrado en disco: ${filePath} — ${e}`); });
+  console.log(`[longform] file size on disk: ${fileStats.size} bytes`);
+  if (fileStats.size === 0) throw new Error("El archivo subido esta vacio (0 bytes). Intenta subir el video de nuevo.");
   const videoDuration = await getMediaDurationSeconds(filePath);
   notes.push(`Duracion fuente: ${formatTimecode(videoDuration)}`);
 

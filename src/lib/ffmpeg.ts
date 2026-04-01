@@ -69,22 +69,69 @@ export async function assertFfmpegInstalled() {
 }
 
 export async function getMediaDurationSeconds(filePath: string): Promise<number> {
+  // Primary: read duration from container format header (fast, works for most MP4/MKV)
   const output = await runBinary(ffprobeBin, [
-    "-v",
-    "error",
-    "-show_entries",
-    "format=duration",
-    "-of",
-    "default=noprint_wrappers=1:nokey=1",
+    "-v", "error",
+    "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
     filePath,
   ]);
 
   const parsed = Number(output);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error("No se pudo leer la duracion del video.");
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+
+  // Fallback: full JSON probe — reads duration from streams too.
+  // Necessary for formats where the container header has no duration metadata
+  // (e.g. videos downloaded from YouTube/Instagram/TikTok via yt-dlp).
+  console.warn(`[ffmpeg] format duration N/A for "${filePath}", falling back to JSON probe`);
+  const json = await runBinary(ffprobeBin, [
+    "-v", "error",
+    "-show_format", "-show_streams",
+    "-print_format", "json",
+    filePath,
+  ]);
+
+  const probe = JSON.parse(json) as {
+    format?: { duration?: string };
+    streams?: Array<{ codec_type?: string; duration?: string }>;
+  };
+
+  const formatDur = Number(probe.format?.duration ?? "");
+  if (Number.isFinite(formatDur) && formatDur > 0) return formatDur;
+
+  const videoDur = Number(
+    (probe.streams ?? []).find((s) => s.codec_type === "video")?.duration ?? ""
+  );
+  if (Number.isFinite(videoDur) && videoDur > 0) return videoDur;
+
+  // Last resort: scan the whole file with -count_packets (slow but reliable)
+  console.warn(`[ffmpeg] JSON probe also failed for "${filePath}", scanning with count_packets`);
+  const scan = await runBinary(ffprobeBin, [
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-count_packets",
+    "-show_entries", "stream=nb_read_packets,r_frame_rate",
+    "-print_format", "json",
+    filePath,
+  ]);
+
+  const scanProbe = JSON.parse(scan) as {
+    streams?: Array<{ nb_read_packets?: string; r_frame_rate?: string }>;
+  };
+  const stream = (scanProbe.streams ?? [])[0];
+  if (stream) {
+    const packets = Number(stream.nb_read_packets ?? "");
+    const fpsRaw = String(stream.r_frame_rate ?? "");
+    const fpsParts = fpsRaw.split("/");
+    const fps = fpsParts.length === 2
+      ? Number(fpsParts[0]) / Number(fpsParts[1])
+      : Number(fpsRaw);
+    if (Number.isFinite(packets) && packets > 0 && Number.isFinite(fps) && fps > 0) {
+      return packets / fps;
+    }
   }
 
-  return parsed;
+  throw new Error("No se pudo leer la duracion del video.");
 }
 
 export async function getMediaDimensions(
