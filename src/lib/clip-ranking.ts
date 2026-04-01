@@ -41,7 +41,7 @@ export type DetectedMoment = {
   start: number;
   end: number;
   title: string;
-  /** Short punchy hook text (2-5 words) for overlay */
+  /** Viral hook sentence used for packaging/copywriting */
   hookText: string;
   /** Best second within the clip for zoompan emphasis */
   zoomTimestamp: number | null;
@@ -115,6 +115,113 @@ const SCENE_CHANGE_MIN_GAP_SECONDS = readFloatEnv("SCENE_CHANGE_MIN_GAP_SECONDS"
 const SCENE_CHANGE_MAX_PER_MINUTE = readFloatEnv("SCENE_CHANGE_MAX_PER_MINUTE", 18, 4, 80);
 const SCENE_BOUNDARY_SNAP_MIN_GAP_SEC = readFloatEnv("SCENE_BOUNDARY_SNAP_MIN_GAP_SEC", 1.1, 0.2, 6);
 const SCENE_NEAR_WINDOW_SEC = readFloatEnv("SCENE_NEAR_WINDOW_SEC", 0.9, 0.2, 3);
+const VIRAL_HOOK_STYLE = String(process.env.VIRAL_HOOK_STYLE ?? "top3").trim().toLowerCase();
+
+type ViralHookTemplate = "never_do_x" | "i_did_x" | "before_you_do_x";
+
+const hookTopicStopWords = new Set([
+  "el", "la", "los", "las", "un", "una", "unos", "unas",
+  "de", "del", "al", "en", "por", "para", "con", "sin", "sobre",
+  "que", "y", "o", "u", "a", "e", "se", "te", "me", "mi", "tu", "su",
+  "lo", "le", "les", "esto", "esta", "este", "estos", "estas",
+  "ya", "muy", "mas", "pero", "porque", "como", "cuando", "donde",
+  "then", "this", "that", "with", "from", "your", "you", "the", "and",
+]);
+
+function normalizeHookTopic(input: string) {
+  const compact = input
+    .toLowerCase()
+    .replace(/[^a-z0-9áéíóúñü\s]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!compact) return "esto";
+
+  const tokens = compact
+    .split(" ")
+    .filter((token) => token.length >= 3 && !hookTopicStopWords.has(token));
+  if (tokens.length === 0) return "esto";
+  return tokens.slice(0, 5).join(" ");
+}
+
+function detectHookTemplateHint(text: string): ViralHookTemplate | null {
+  const lower = text.toLowerCase();
+  if (
+    /nunca\s+hagas|no\s+hagas|peor\s+que\s+puedes\s+hacer|error\s+fatal|evita\s+hacer/.test(lower)
+  ) {
+    return "never_do_x";
+  }
+  if (/\bhice\b|me\s+paso|intent[eé]|prob[eé]|y\s+esto\s+pas[oó]/.test(lower)) {
+    return "i_did_x";
+  }
+  if (/si\s+vas\s+a\s+hacer|antes\s+de\s+hacer|primero\s+mira\s+este\s+video/.test(lower)) {
+    return "before_you_do_x";
+  }
+  return null;
+}
+
+function chooseViralHookTemplate(text: string): ViralHookTemplate {
+  const hinted = detectHookTemplateHint(text);
+  if (hinted) return hinted;
+
+  const lower = text.toLowerCase();
+  let neverScore = 0;
+  let didScore = 0;
+  let beforeScore = 0;
+
+  if (/nunca|jam[aá]s|cuidado|riesgo|error|peor|arruina|prohibido/.test(lower)) neverScore += 3;
+  if (/\bhice\b|me\s+pas[oó]|intent[eé]|prob[eé]|grab[eé]|fu[ií]/.test(lower)) didScore += 3;
+  if (/si\s+vas\s+a|antes\s+de|primero|mira\s+esto|te\s+conviene/.test(lower)) beforeScore += 3;
+
+  if (/\bno\b/.test(lower)) neverScore += 1;
+  if (/\byo\b|\bmi\b|\bme\b/.test(lower)) didScore += 1;
+  if (/\bsi\b|\bprimero\b/.test(lower)) beforeScore += 1;
+
+  const maxScore = Math.max(neverScore, didScore, beforeScore);
+  const tied: ViralHookTemplate[] = [];
+  if (neverScore === maxScore) tied.push("never_do_x");
+  if (didScore === maxScore) tied.push("i_did_x");
+  if (beforeScore === maxScore) tied.push("before_you_do_x");
+
+  if (tied.length === 1) return tied[0];
+  const tieBreaker = Math.abs(text.length) % tied.length;
+  return tied[tieBreaker] ?? "before_you_do_x";
+}
+
+function buildTopViralHook(text: string, preferredTemplate?: ViralHookTemplate | null) {
+  const topic = normalizeHookTopic(text);
+  const template = preferredTemplate ?? chooseViralHookTemplate(text);
+
+  switch (template) {
+    case "never_do_x":
+      return `Nunca hagas ${topic} porque es lo peor que puedes hacer`;
+    case "i_did_x":
+      return `Hice ${topic} y esto paso`;
+    case "before_you_do_x":
+    default:
+      return `Si vas a hacer ${topic}, primero mira este video`;
+  }
+}
+
+function normalizeHookText(rawHookText: string, contextText: string) {
+  const candidate = rawHookText
+    .replace(/[“”"]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const clipped = candidate.slice(0, 140);
+
+  if (VIRAL_HOOK_STYLE === "legacy") {
+    return clipped ? clipped.toUpperCase().slice(0, 40) : "";
+  }
+
+  const matchedTemplate = detectHookTemplateHint(clipped);
+  if (matchedTemplate) {
+    return buildTopViralHook(`${clipped} ${contextText}`.trim(), matchedTemplate);
+  }
+
+  const source = `${clipped} ${contextText}`.trim();
+  if (!source) return "";
+  return buildTopViralHook(source);
+}
 
 // ---------------------------------------------------------------------------
 // Ad / sponsor detection
@@ -351,6 +458,10 @@ REGLAS CRITICAS:
    - Si hay una broma, incluye la PREGUNTA o situacion que genera la broma.
    - El clip ideal: el espectador entiende la situacion en los primeros 5s, se engancha, y el payoff llega despues.
 10. Varia los TIPOS de clips. No selecciones solo momentos de risa. Incluye: momentos de tension, revelaciones, historias emotivas, confrontaciones, opiniones polemicas, momentos WTF, fails, reacciones genuinas.
+11. El "hookText" debe usar UNA de estas formulas virales (adaptada al contexto real del clip):
+   - Nunca hagas (x) porque es lo peor que puedes hacer
+   - Hice (x) y esto paso
+   - Si vas a hacer (x) primero mira este video
 
 SCORING (0-100 cada uno):
 - hook: Los primeros 3 segundos del clip detienen el scroll? Hay una frase gancho, sorpresa, o tension inmediata? BONUS si hay accion visual inmediata.
@@ -360,7 +471,7 @@ SCORING (0-100 cada uno):
 
 PARA CADA MOMENTO GENERA:
 - title: Titulo viral corto (6-8 palabras, sin emojis/hashtags)
-- hookText: Texto ULTRA-CORTO (2-5 palabras MAX) que aparecera como overlay visual al inicio. Debe generar curiosidad INMEDIATA. Ejemplos: "NO PUEDE SER", "MIRA ESTO", "SE ARREPINTIO", "LO QUE HIZO DESPUES"
+- hookText: Frase de gancho viral (8-18 palabras) usando SOLO una de las 3 formulas indicadas arriba y reemplazando (x) por el tema real del clip.
 - zoomTimestamp: El segundo EXACTO dentro del clip donde ocurre el momento mas intenso (para aplicar zoom). Debe ser un timestamp absoluto del video original.
 - descriptions: Objeto con 3 descripciones adaptadas a cada plataforma:
   - tiktok: Caption corta y casual con CTA. Ejemplo: "No me esperaba este final... Sigueme para mas 🔥 #viral"
@@ -368,7 +479,7 @@ PARA CADA MOMENTO GENERA:
   - youtube: Descripcion para YouTube Shorts, clickbait pero real. Ejemplo: "Nadie se esperaba lo que paso en el segundo 15..."
 
 RESPONDE UNICAMENTE CON JSON VALIDO, SIN MARKDOWN NI TEXTO ADICIONAL:
-{"moments":[{"start":12.5,"end":38.2,"title":"Titulo viral corto","hookText":"NO PUEDE SER","zoomTimestamp":25.3,"descriptions":{"tiktok":"Caption TikTok...","instagram":"Caption Instagram...","youtube":"Caption YouTube..."},"hook":85,"flow":78,"engagement":92,"completeness":80,"rationale":"Por que este momento es viral"}]}
+{"moments":[{"start":12.5,"end":38.2,"title":"Titulo viral corto","hookText":"Si vas a hacer esto primero mira este video","zoomTimestamp":25.3,"descriptions":{"tiktok":"Caption TikTok...","instagram":"Caption Instagram...","youtube":"Caption YouTube..."},"hook":85,"flow":78,"engagement":92,"completeness":80,"rationale":"Por que este momento es viral"}]}
 
 Los timestamps deben ser en SEGUNDOS (decimal).`;
 
@@ -453,12 +564,13 @@ Los timestamps deben ser en SEGUNDOS (decimal).`;
           instagram: String(m.descriptions?.instagram ?? "").trim().slice(0, 300),
           youtube: String(m.descriptions?.youtube ?? "").trim().slice(0, 300),
         };
+        const normalizedHookText = normalizeHookText(String(m.hookText ?? ""), preview);
 
         return {
           start: Number(start.toFixed(2)),
           end: Number(end.toFixed(2)),
           title: String(m.title ?? "").trim().slice(0, 80) || "Clip viral",
-          hookText: String(m.hookText ?? "").trim().slice(0, 40).toUpperCase() || "",
+          hookText: normalizedHookText,
           zoomTimestamp,
           descriptions,
           scores,
@@ -1558,7 +1670,7 @@ export function buildHeuristicMoments(params: {
         start: Number(start.toFixed(2)),
         end: Number(end.toFixed(2)),
         title: "Clip viral",
-        hookText: "",
+        hookText: normalizeHookText("", preview),
         zoomTimestamp: null,
         descriptions: { tiktok: "", instagram: "", youtube: "" },
         scores: {

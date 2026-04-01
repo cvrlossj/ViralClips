@@ -151,6 +151,8 @@ const CLIP_DIVERSITY_MAX_OVERLAP_RATIO = readFloatEnv("CLIP_DIVERSITY_MAX_OVERLA
 const CLIP_DIVERSITY_MIN_SEPARATION_SECONDS = readDurationEnv("CLIP_DIVERSITY_MIN_SEPARATION_SECONDS", 12, 0, 60);
 const CLIP_DIVERSITY_MAX_GATE_DROP = readDurationEnv("CLIP_DIVERSITY_MAX_GATE_DROP", 4, 0, 30);
 const CLIP_DIVERSITY_REQUIRE_PASS_WHEN_TOP_PASS = readBooleanEnv("CLIP_DIVERSITY_REQUIRE_PASS_WHEN_TOP_PASS", true);
+const HOOK_TEXT_OVERLAY_ENABLED = readBooleanEnv("HOOK_TEXT_OVERLAY_ENABLED", false);
+const HOOK_OPTIMIZER_TRANSITION_TEXT_ENABLED = readBooleanEnv("HOOK_OPTIMIZER_TRANSITION_TEXT_ENABLED", false);
 
 async function loadActiveBenchmarkContext(): Promise<string> {
   try {
@@ -1167,7 +1169,7 @@ export async function renderSingleClip(params: {
   const hasWatermark = !!watermarkPath;
 
   // Hook text overlay: big text shown in first 3 seconds
-  const hookTextFilter = params.hookText
+  const hookTextFilter = HOOK_TEXT_OVERLAY_ENABLED && params.hookText
     ? `drawtext=text='${ensureTextForDrawText(params.hookText)}':font='Arial Black':fontcolor=yellow:fontsize=64:borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.35:enable='between(t,0.2,3.0)'`
     : "";
 
@@ -1376,11 +1378,14 @@ async function applyHookOptimizer(params: {
       hookSegPath,
     ]);
 
-    // 2. Create a brief transition frame (0.8s black with text "Momentos antes...")
+    // 2. Create a brief transition frame (0.8s black; optional text)
+    const transitionFilter = HOOK_OPTIMIZER_TRANSITION_TEXT_ENABLED
+      ? "color=c=black:s=1080x1920:d=0.8,drawtext=text='Momentos antes...':font=Arial:fontcolor=white@0.85:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2"
+      : "color=c=black:s=1080x1920:d=0.8";
     await runFfmpeg([
       "-y",
       "-f", "lavfi",
-      "-i", `color=c=black:s=1080x1920:d=0.8,drawtext=text='Momentos antes...':font=Arial:fontcolor=white@0.85:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2`,
+      "-i", transitionFilter,
       "-f", "lavfi",
       "-i", "anullsrc=r=44100:cl=stereo",
       "-t", "0.8",
@@ -2090,6 +2095,12 @@ export async function processVideo(input: PipelineInput): Promise<PipelineResult
 
     const notes = [
       "Overlay de subtitulos y titulo desactivado para edicion externa (CapCut).",
+      HOOK_TEXT_OVERLAY_ENABLED
+        ? "Overlay de hook textual activo (primeros segundos del clip)."
+        : "Overlay textual de hook desactivado para evitar texto quemado en video.",
+      HOOK_OPTIMIZER_TRANSITION_TEXT_ENABLED
+        ? "Hook optimizer con texto de transicion activo."
+        : "Hook optimizer sin texto de transicion (solo flash visual).",
       `Duracion minima objetivo por clip: ${MIN_FINAL_CLIP_DURATION_SEC}s (si el metraje lo permite).`,
       usedLlmDetection
         ? visualAnalysis

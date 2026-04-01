@@ -66,6 +66,10 @@ Abre http://localhost:3000.
 
 - Si no existe `OPENAI_API_KEY`, el sistema igualmente genera clips sin subtitulos.
 - Si OpenAI devuelve `429` (cuota/billing), el pipeline entra en fallback contextual sin transcripcion, priorizando ventanas largas guiadas por cambios de escena.
+- El pipeline usa hooks virales estilo top con 3 formulas (configurable por `VIRAL_HOOK_STYLE`; por defecto `top3`):
+  - `Nunca hagas (x) porque es lo peor que puedes hacer`
+  - `Hice (x) y esto paso`
+  - `Si vas a hacer (x), primero mira este video`
 - Puedes ajustar la duracion del fallback sin transcripcion con:
   - `CLIP_NO_TRANSCRIPT_MIN_DURATION_SECONDS`
   - `CLIP_NO_TRANSCRIPT_MAX_DURATION_SECONDS`
@@ -73,5 +77,6 @@ Abre http://localhost:3000.
 - El pipeline incluye "quality rescue" para clips con gate/engagement bajos; puedes calibrarlo con `QUALITY_RESCUE_ENABLED`, `QUALITY_RESCUE_MAX_EXTRA_SECONDS`, `QUALITY_RESCUE_MIN_GATE_GAIN`, `QUALITY_RESCUE_TRIGGER_MARGIN` y `QUALITY_RESCUE_MAX_EARLY_SHIFT_SECONDS`.
 - Para evitar clips casi duplicados, ajusta `CLIP_DIVERSITY_MAX_OVERLAP_RATIO` y `CLIP_DIVERSITY_MIN_SEPARATION_SECONDS`.
 - Para evitar que la diversidad empeore el resultado, usa `CLIP_DIVERSITY_MAX_GATE_DROP` y `CLIP_DIVERSITY_REQUIRE_PASS_WHEN_TOP_PASS`.
+- Para no quemar texto en el video final, deja `HOOK_TEXT_OVERLAY_ENABLED=false` y `HOOK_OPTIMIZER_TRANSITION_TEXT_ENABLED=false`.
 - El pipeline prioriza estabilidad para MVP local, no velocidad maxima.
 - Puedes limpiar `storage/outputs` y `storage/tmp` manualmente cuando quieras.

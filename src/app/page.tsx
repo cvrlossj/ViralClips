@@ -633,7 +633,7 @@ export default function Home() {
                       )}
                     </div>
                     <p className="text-xs text-(--muted-fg)">
-                      Subtitulos y titulo en video desactivados en este pipeline. Puedes editarlos luego en CapCut.
+                      Subtitulos y titulo en video desactivados en este pipeline. Si el video fuente ya trae subtitulos quemados, no se pueden quitar automaticamente.
                     </p>
                   </TabsContent>
 
@@ -767,7 +767,7 @@ export default function Home() {
                     { label: "Deteccion multimodal (audio + video)", enabled: true },
                     { label: "Hook optimizer (spoiler hook)", enabled: hookOptimizer },
                     { label: "Thumbnails automaticos", enabled: true },
-                    { label: "Hook text overlay", enabled: true },
+                    { label: "Hook text overlay (desactivado por defecto)", enabled: false },
                     { label: "Zoom dinamico en momentos clave", enabled: true },
                     { label: "Copys multi-plataforma (TikTok/IG/YT)", enabled: true },
                     { label: "Subtitulos y titulo en overlay", enabled: false },
