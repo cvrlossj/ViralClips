@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import OpenAI from "openai";
 
-import { runFfmpeg, getMediaDurationSeconds, getMediaDimensions, extractCompressedAudio, extractKeyframes } from "@/lib/ffmpeg";
+import { runFfmpeg, getMediaDurationSeconds, extractCompressedAudio, extractKeyframes } from "@/lib/ffmpeg";
 import { canTranscribe, transcribeVerbose } from "@/lib/transcription";
 import { detectSceneChangeTimes, detectAdSegments, buildHeuristicMoments } from "@/lib/clip-ranking";
 import type { DetectedMoment, AdSegment } from "@/lib/clip-ranking";
@@ -588,8 +588,13 @@ export async function compileLongformVideo(input: LongformInput): Promise<Longfo
   );
   notes.push(`Segmentos extraidos: ${segmentPaths.length}`);
 
+  // Durations are known from the moment timestamps — no need to probe segments
+  const momentDurations = moments.map((m) => m.end - m.start);
+  const TITLE_CARD_DURATION = 3;
+
   // L-4: Intro/outro title cards
   let allSegments = [...segmentPaths];
+  let allDurations = [...momentDurations];
   let introPath: string | null = null;
   let outroPath: string | null = null;
 
@@ -598,14 +603,14 @@ export async function compileLongformVideo(input: LongformInput): Promise<Longfo
       introPath = await buildTitleCard({ jobId: `${jobId}_i`, creatorName, width: outWidth, height: outHeight });
       outroPath = await buildTitleCard({ jobId: `${jobId}_o`, creatorName: `${creatorName} — Suscribete`, width: outWidth, height: outHeight });
       allSegments = [introPath, ...segmentPaths, outroPath];
+      allDurations = [TITLE_CARD_DURATION, ...momentDurations, TITLE_CARD_DURATION];
       notes.push("Intro y outro generados");
     } catch {
       notes.push("Intro/outro fallaron, omitidos");
     }
   }
 
-  // Get actual durations for each segment
-  const segmentDurations = await Promise.all(allSegments.map((p) => getMediaDurationSeconds(p)));
+  const segmentDurations = allDurations;
 
   // L-4: Assembly
   const finalOutputPath = path.join(outputDir, `${jobId}_lf_final.mp4`);
