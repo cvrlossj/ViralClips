@@ -10,3 +10,4 @@ export const sourcesDir = path.join(storageRoot, "sources");
 export const jobsDir = path.join(storageRoot, "jobs");
 export const framesDir = path.join(storageRoot, "frames");
 export const benchmarksDir = path.join(storageRoot, "benchmarks");
+export const longformDir = path.join(storageRoot, "longform");

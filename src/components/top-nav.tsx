@@ -2,10 +2,11 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BarChart3, Clapperboard } from "lucide-react";
+import { BarChart3, Clapperboard, Youtube } from "lucide-react";
 
 const items = [
   { href: "/", label: "Crear clips", icon: Clapperboard },
+  { href: "/longform", label: "Videos Largos", icon: Youtube },
   { href: "/dashboard", label: "Dashboard", icon: BarChart3 },
 ];
 
